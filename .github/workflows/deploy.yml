@@ -1,5 +1,5 @@
-name: Deploy Monorepo
-run-name: "${{ github.event_name == 'repository_dispatch' && format('deploy {0} [{1}]', github.event.client_payload.source_sha, github.event.client_payload.dispatch_id) || format('deploy {0} [manual]', inputs.ref) }}"
+name: Deploy Zhiduoduo Production
+run-name: "deploy ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_sha || inputs.ref }} [${{ github.event_name == 'repository_dispatch' && github.event.client_payload.dispatch_id || 'manual' }}]"
 
 on:
   repository_dispatch:
@@ -7,116 +7,147 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Commit SHA to deploy'
+        description: Immutable source commit SHA
         required: true
       repo:
-        description: 'Source repo (owner/name)'
+        description: Source repository
         required: true
+        default: Infinity-light/ai-agent-distro
+
+permissions:
+  contents: read
 
 concurrency:
-  group: deploy-zhiduoduo-platform
+  group: zhiduoduo-production
   cancel-in-progress: false
 
 jobs:
   deploy:
-    runs-on: [self-hosted, Linux, X64]
-    permissions:
-      contents: read
-    timeout-minutes: 25
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - name: Resolve inputs
-        id: inputs
+      - name: Resolve and bind immutable source
+        id: source
+        shell: bash
         run: |
+          set -Eeuo pipefail
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
-            echo "repo=${{ github.event.client_payload.repo }}" >> $GITHUB_OUTPUT
+            REF='${{ github.event.client_payload.ref }}'
+            REPO='${{ github.event.client_payload.repo }}'
+            SOURCE_SHA='${{ github.event.client_payload.source_sha }}'
+            DISPATCH_ID='${{ github.event.client_payload.dispatch_id }}'
           else
-            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
-            echo "repo=${{ github.event.inputs.repo }}" >> $GITHUB_OUTPUT
+            REF='${{ inputs.ref }}'
+            REPO='${{ inputs.repo }}'
+            SOURCE_SHA='${{ inputs.ref }}'
+            DISPATCH_ID="manual-${{ github.run_id }}"
           fi
+          test "$REPO" = "Infinity-light/ai-agent-distro"
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]]
+          test "$REF" = "$SOURCE_SHA"
+          test -n "$DISPATCH_ID"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "dispatch_id=$DISPATCH_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout source repo
-        uses: actions/checkout@v4
+      - name: Checkout private source at bound SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: ${{ steps.inputs.outputs.repo }}
-          ref: ${{ steps.inputs.outputs.ref }}
+          repository: ${{ steps.source.outputs.repo }}
+          ref: ${{ steps.source.outputs.ref }}
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
 
-      - name: Sync source to deploy dir
-        run: |
-          mkdir -p /opt/apps/zhiduoduo-platform
-          rsync -a --exclude='.git' --exclude='node_modules' --exclude='_work' \
-            ./ /opt/apps/zhiduoduo-platform/
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 10.30.1
 
-      - name: Build apps on host
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install, audit, test, and build release
         run: |
-          cd /opt/apps/zhiduoduo-platform
+          set -Eeuo pipefail
           pnpm install --frozen-lockfile
+          pnpm audit --prod --audit-level=moderate --registry=https://registry.npmjs.org
+          pnpm exec prisma generate
+          pnpm test
+          pnpm build
+          pnpm --filter @zhiduoduo/storefront exec tsc --noEmit
+          pnpm --filter @zhiduoduo/storefront build
+          pnpm --filter @zhiduoduo/admin exec tsc --noEmit
+          pnpm --filter @zhiduoduo/admin build
 
-          pnpm --filter server build
+      - name: Package immutable release and deployment script
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          from pathlib import Path
 
+          source = Path('.github/workflows/deploy.legacy-disabled.yml.off').read_text(encoding='utf-8')
+          marker = '          script: |\n'
+          if marker not in source:
+              raise SystemExit('deployment script marker missing')
+          block = source.split(marker, 1)[1]
+          lines = []
+          for line in block.splitlines():
+              if line and not line.startswith('            '):
+                  raise SystemExit(f'unexpected deployment script indentation: {line[:80]}')
+              lines.append(line[12:] if line else '')
+          Path('production-deploy.sh').write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+          PY
+          bash -n production-deploy.sh
+          tar -czf deploy.tar.gz \
+            dist/ \
+            apps/storefront/dist/ \
+            apps/storefront/package.json \
+            apps/admin/dist/ \
+            apps/admin/package.json \
+            prisma/ \
+            package.json \
+            pnpm-lock.yaml \
+            pnpm-workspace.yaml \
+            nest-cli.json \
+            tsconfig.json \
+            ecosystem.config.js \
+            nginx/ \
+            .env.example
 
+      - name: Copy release to production server
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: deploy.tar.gz
+          target: /opt/apps/zhiduoduo-platform/
 
-      - name: Build and deploy
+      - name: Deploy release with database backup, health, and stability acceptance
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          RELEASE_ID: ${{ steps.source.outputs.source_sha }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GPT_IMAGE_BASE_URL: ${{ secrets.GPT_IMAGE_BASE_URL }}
           GPT_IMAGE_API_KEY: ${{ secrets.GPT_IMAGE_API_KEY }}
+          OSS_REGION: ${{ secrets.OSS_REGION }}
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          command_timeout: 25m
+          envs: RELEASE_ID,DEEPSEEK_API_KEY,GPT_IMAGE_BASE_URL,GPT_IMAGE_API_KEY,OSS_REGION,OSS_ACCESS_KEY_ID,OSS_ACCESS_KEY_SECRET,OSS_BUCKET,ARK_API_KEY
+          script_path: production-deploy.sh
+
+      - name: Record bound release acceptance
         run: |
-          set -e
-          cd /opt/apps/zhiduoduo-platform
-
-          echo "=== Writing .env ==="
-          : > .env
-          cat > .env << 'ENVEOF'
-          NODE_ENV=production
-          VERIFICATION_PROVIDER=disabled
-          REQUIRE_VERIFIED_PHONE_REGISTRATION=false
-          ENVEOF
-          sed -i 's/^ *//' .env
-          printf '%s=%s\n' 'SERVER_PASSWORD' "${SERVER_PASSWORD}" >> .env
-          printf '%s=%s\n' 'DEEPSEEK_API_KEY' "${DEEPSEEK_API_KEY}" >> .env
-          printf '%s=%s\n' 'GPT_IMAGE_BASE_URL' "${GPT_IMAGE_BASE_URL}" >> .env
-          printf '%s=%s\n' 'GPT_IMAGE_API_KEY' "${GPT_IMAGE_API_KEY}" >> .env
-          printf '%s=%s\n' 'OSS_ACCESS_KEY_ID' "${OSS_ACCESS_KEY_ID}" >> .env
-          printf '%s=%s\n' 'OSS_ACCESS_KEY_SECRET' "${OSS_ACCESS_KEY_SECRET}" >> .env
-          printf '%s=%s\n' 'ARK_API_KEY' "${ARK_API_KEY}" >> .env
-
-          echo "=== Building images ==="
-          docker compose -f docker-compose.prod.yml build
-
-          echo "=== Starting containers ==="
-          docker compose -f docker-compose.prod.yml up -d --remove-orphans
-
-
-          echo "=== Database migration ==="
-          pnpm exec prisma migrate deploy
-
-
-          echo "=== Cleanup ==="
-          docker image prune -f
-
-
-
-      - name: Health check
-        run: |
-          echo "Waiting for containers to start..."
-          sleep 10
-          for i in 1 2 3 4 5; do
-            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/ || true)
-            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
-              echo "Health check passed (HTTP $STATUS)"
-              exit 0
-            fi
-            echo "Attempt $i: HTTP $STATUS, retrying in 5s..."
-            sleep 5
-          done
-          echo "Health check failed after 5 attempts"
-          docker ps --filter name=zhiduoduo-platform
-          docker logs zhiduoduo-platform-server-1 --tail 30 2>/dev/null || true
-          exit 1
+          echo "Accepted source_sha=${{ steps.source.outputs.source_sha }}"
+          echo "dispatch_id=${{ steps.source.outputs.dispatch_id }}"
