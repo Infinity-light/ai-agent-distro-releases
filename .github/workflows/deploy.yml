@@ -1,0 +1,122 @@
+name: Deploy Monorepo
+run-name: "${{ github.event_name == 'repository_dispatch' && format('deploy {0} [{1}]', github.event.client_payload.source_sha, github.event.client_payload.dispatch_id) || format('deploy {0} [manual]', inputs.ref) }}"
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit SHA to deploy'
+        required: true
+      repo:
+        description: 'Source repo (owner/name)'
+        required: true
+
+concurrency:
+  group: deploy-zhiduoduo-platform
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+    timeout-minutes: 25
+
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.client_payload.repo }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.inputs.repo }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.inputs.outputs.repo }}
+          ref: ${{ steps.inputs.outputs.ref }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+
+      - name: Sync source to deploy dir
+        run: |
+          mkdir -p /opt/apps/zhiduoduo-platform
+          rsync -a --exclude='.git' --exclude='node_modules' --exclude='_work' \
+            ./ /opt/apps/zhiduoduo-platform/
+
+      - name: Build apps on host
+        run: |
+          cd /opt/apps/zhiduoduo-platform
+          pnpm install --frozen-lockfile
+
+          pnpm --filter server build
+
+
+
+      - name: Build and deploy
+        env:
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GPT_IMAGE_BASE_URL: ${{ secrets.GPT_IMAGE_BASE_URL }}
+          GPT_IMAGE_API_KEY: ${{ secrets.GPT_IMAGE_API_KEY }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+        run: |
+          set -e
+          cd /opt/apps/zhiduoduo-platform
+
+          echo "=== Writing .env ==="
+          : > .env
+          cat > .env << 'ENVEOF'
+          NODE_ENV=production
+          VERIFICATION_PROVIDER=disabled
+          REQUIRE_VERIFIED_PHONE_REGISTRATION=false
+          ENVEOF
+          sed -i 's/^ *//' .env
+          printf '%s=%s\n' 'SERVER_PASSWORD' "${SERVER_PASSWORD}" >> .env
+          printf '%s=%s\n' 'DEEPSEEK_API_KEY' "${DEEPSEEK_API_KEY}" >> .env
+          printf '%s=%s\n' 'GPT_IMAGE_BASE_URL' "${GPT_IMAGE_BASE_URL}" >> .env
+          printf '%s=%s\n' 'GPT_IMAGE_API_KEY' "${GPT_IMAGE_API_KEY}" >> .env
+          printf '%s=%s\n' 'OSS_ACCESS_KEY_ID' "${OSS_ACCESS_KEY_ID}" >> .env
+          printf '%s=%s\n' 'OSS_ACCESS_KEY_SECRET' "${OSS_ACCESS_KEY_SECRET}" >> .env
+          printf '%s=%s\n' 'ARK_API_KEY' "${ARK_API_KEY}" >> .env
+
+          echo "=== Building images ==="
+          docker compose -f docker-compose.prod.yml build
+
+          echo "=== Starting containers ==="
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+
+          echo "=== Database migration ==="
+          pnpm exec prisma migrate deploy
+
+
+          echo "=== Cleanup ==="
+          docker image prune -f
+
+
+
+      - name: Health check
+        run: |
+          echo "Waiting for containers to start..."
+          sleep 10
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/ || true)
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "Health check passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS, retrying in 5s..."
+            sleep 5
+          done
+          echo "Health check failed after 5 attempts"
+          docker ps --filter name=zhiduoduo-platform
+          docker logs zhiduoduo-platform-server-1 --tail 30 2>/dev/null || true
+          exit 1
