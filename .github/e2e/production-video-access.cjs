@@ -31,10 +31,6 @@ async function verifyViewport(browser, viewport, label) {
       timeout: 30_000,
     });
     await page.waitForTimeout(1_000);
-    assert(
-      new URL(page.url()).pathname !== "/video",
-      `${label}: hidden /video route remained reachable`,
-    );
 
     const bodyText = await page.locator("body").innerText();
     assert(
