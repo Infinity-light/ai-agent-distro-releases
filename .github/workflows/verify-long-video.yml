@@ -1,0 +1,275 @@
+name: Verify Zhiduoduo Long Video Production
+run-name: "verify long-video ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound production deployment run ID
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Validate bound release evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ '${{ inputs.source_sha }}' =~ ^[0-9a-f]{40}$ ]]
+          [[ '${{ inputs.release_run_id }}' =~ ^[0-9]+$ ]]
+          run=$(gh api 'repos/Infinity-light/ai-agent-distro-releases/actions/runs/${{ inputs.release_run_id }}')
+          RUN="$run" SOURCE_SHA='${{ inputs.source_sha }}' node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound release run is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Bound release run does not contain source SHA");
+          '
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install production browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.0
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+
+      - name: Verify hidden video entry on desktop and mobile
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node .github/e2e/production-video-access.cjs
+
+      - name: Verify admin Chat long-video and per-segment billing
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
+        env:
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          command_timeout: 45m
+          envs: EXPECTED_RELEASE
+          script: |
+            set -Eeuo pipefail
+            APP_ROOT=/opt/apps/zhiduoduo-platform
+            ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+            SHARED_ENV="$APP_ROOT/shared/.env"
+            test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+            cd "$ACTIVE_RELEASE"
+            node --env-file="$SHARED_ENV" <<'NODE'
+            const { PrismaClient } = require('@prisma/client');
+            const jwt = require('jsonwebtoken');
+            const prisma = new PrismaClient();
+            const apiBase = 'http://127.0.0.1:3100/api';
+            const expectedRelease = process.env.EXPECTED_RELEASE;
+            let adminId = '';
+            let normalId = '';
+            let generationId = '';
+
+            function assert(condition, message) {
+              if (!condition) throw new Error(message);
+            }
+
+            function bearer(token) {
+              return { authorization: `Bearer ${token}` };
+            }
+
+            function tokenFor(user) {
+              return jwt.sign(
+                { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+                process.env.JWT_SECRET,
+                { expiresIn: '50m' },
+              );
+            }
+
+            async function jsonResponse(response, label) {
+              const body = await response.json();
+              if (!response.ok || (body.code !== undefined && body.code !== 0)) {
+                throw new Error(`${label} failed with ${response.status}: ${JSON.stringify(body).slice(0, 500)}`);
+              }
+              return body.data ?? body;
+            }
+
+            async function chat(token, message, conversationId) {
+              const response = await fetch(`${apiBase}/ai/chat/send/stream`, {
+                method: 'POST',
+                headers: { ...bearer(token), 'content-type': 'application/json' },
+                body: JSON.stringify({ message, ...(conversationId ? { conversationId } : {}) }),
+                signal: AbortSignal.timeout(180_000),
+              });
+              assert(response.ok, `Chat stream returned HTTP ${response.status}`);
+              const text = await response.text();
+              const events = text.split(/\r?\n/)
+                .filter((line) => line.startsWith('data: '))
+                .map((line) => JSON.parse(line.slice(6)));
+              const error = events.find((event) => event.type === 'error');
+              if (error) throw new Error(`Chat stream error: ${error.message}`);
+              const done = events.find((event) => event.type === 'done');
+              assert(done?.payload?.conversationId, 'Chat stream did not return a completed conversation');
+              return { events, payload: done.payload };
+            }
+
+            async function deleteOssObjects(generation) {
+              const meta = generation?.metadata && typeof generation.metadata === 'object' ? generation.metadata : {};
+              const urls = [
+                generation?.videoUrl,
+                ...(Array.isArray(meta.segments) ? meta.segments.map((segment) => segment.videoUrl) : []),
+              ].filter(Boolean);
+              if (!urls.length || !process.env.OSS_REGION || !process.env.OSS_ACCESS_KEY_ID || !process.env.OSS_ACCESS_KEY_SECRET || !process.env.OSS_BUCKET) return;
+              const OSS = require('ali-oss');
+              const client = new OSS({
+                region: process.env.OSS_REGION,
+                accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+                accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+                bucket: process.env.OSS_BUCKET,
+                secure: true,
+              });
+              for (const value of urls) {
+                const key = decodeURIComponent(new URL(value).pathname).replace(/^\/+/, '');
+                if (!/^(video-segments|videos)\//.test(key)) continue;
+                try { await client.delete(key); } catch (error) {
+                  if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
+                }
+              }
+            }
+
+            async function cleanupUser(userId) {
+              if (!userId) return;
+              const generation = generationId
+                ? await prisma.aiGeneration.findUnique({ where: { id: generationId } })
+                : null;
+              if (generation) await deleteOssObjects(generation);
+              const conversations = await prisma.aiConversation.findMany({ where: { userId }, select: { id: true } });
+              const conversationIds = conversations.map((item) => item.id);
+              if (conversationIds.length) await prisma.aiMessage.deleteMany({ where: { conversationId: { in: conversationIds } } });
+              await prisma.aiConversation.deleteMany({ where: { userId } });
+              await prisma.aiGeneration.updateMany({ where: { userId }, data: { relatedId: null } });
+              await prisma.tokenUsageLog.deleteMany({ where: { userId } });
+              await prisma.creditReservation.deleteMany({ where: { userId } });
+              await prisma.dailyTokenUsage.deleteMany({ where: { userId } });
+              await prisma.aiGeneration.deleteMany({ where: { userId } });
+              await prisma.tokenPack.deleteMany({ where: { userId } });
+              await prisma.user.deleteMany({ where: { id: userId } });
+            }
+
+            (async () => {
+              const health = await jsonResponse(await fetch(`${apiBase}/health`), 'production health');
+              assert(health.status === 'ok' && health.release === expectedRelease, `Unexpected active release ${health.release}`);
+
+              const suffix = `${Date.now()}-${process.pid}`;
+              const admin = await prisma.user.create({
+                data: {
+                  phone: `video-admin-e2e-${suffix}`,
+                  email: `video-admin-e2e-${suffix}@test.local`,
+                  passwordHash: 'disabled-production-e2e-account',
+                  name: 'Video Admin Production E2E',
+                  role: 'PLATFORM_ADMIN',
+                  isActivated: true,
+                  tokenPacks: { create: { name: 'Video E2E Credits', totalTokens: 5000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
+                },
+              });
+              adminId = admin.id;
+              const normal = await prisma.user.create({
+                data: {
+                  phone: `video-normal-e2e-${suffix}`,
+                  email: `video-normal-e2e-${suffix}@test.local`,
+                  passwordHash: 'disabled-production-e2e-account',
+                  name: 'Video Normal Production E2E',
+                  role: 'TERMINAL_USER',
+                  isActivated: true,
+                },
+              });
+              normalId = normal.id;
+              const adminToken = tokenFor(admin);
+              const normalToken = tokenFor(normal);
+
+              const denied = await fetch(`${apiBase}/ai/generate/video/options`, { headers: bearer(normalToken) });
+              assert(denied.status === 403, `Normal user video options returned ${denied.status}, expected 403`);
+              const options = await jsonResponse(
+                await fetch(`${apiBase}/ai/generate/video/options`, { headers: bearer(adminToken) }),
+                'admin video options',
+              );
+              assert(Array.isArray(options.models) && options.models.length === 3, 'Admin did not receive exactly three video models');
+
+              const planning = await chat(
+                adminToken,
+                '我想制作一条16秒的9:16竖屏连续咖啡品牌短片，Seedance 2.0 Mini、720p、有声、无水印、不固定机位，拆成两个8秒镜头：第一段清晨推门进入咖啡店并走到吧台，第二段必须延续上一段结尾姿态接过咖啡并微笑。请先给出最终方案、续写风险和精确积分，当前尚未确认生成。',
+              );
+              const premature = planning.events.find(
+                (event) => event.type === 'tool_result' && event.result?.toolName === 'generate_long_video' && event.result?.success,
+              );
+              assert(!premature, 'Chat started a long video before explicit confirmation');
+              assert(String(planning.payload.message).includes('1600'), 'Planning turn did not present the exact 1600-credit cost');
+
+              const confirmed = await chat(
+                adminToken,
+                '我确认生成。最终方案不变：标题“生产验收咖啡长片”；第一段8秒，清晨同一人物推门进入咖啡店并走到吧台；第二段8秒，严格延续上一段尾帧的人物姿态和场景，接过咖啡并微笑；Seedance 2.0 Mini，9:16，720p，有声，无水印，不固定机位。我接受尾帧续写仍可能存在轻微漂移的风险，并明确确认总计1600积分，请现在一次提交这两个连续片段。',
+                planning.payload.conversationId,
+              );
+              const toolEvent = confirmed.events.find(
+                (event) => event.type === 'tool_result' && event.result?.toolName === 'generate_long_video',
+              );
+              assert(toolEvent?.result?.success, 'Confirmed Chat turn did not successfully call generate_long_video');
+              generationId = toolEvent.result.data?.id;
+              assert(generationId, 'Long-video tool result did not return a generation ID');
+              assert(toolEvent.result.data?.segmentCount === 2 && toolEvent.result.data?.totalDuration === 16, 'Long-video task shape is not 2 segments / 16 seconds');
+              assert(toolEvent.result.data?.creditCost === 1600, 'Long-video task did not retain the confirmed 1600-credit cost');
+
+              let status;
+              const deadline = Date.now() + 35 * 60_000;
+              while (Date.now() < deadline) {
+                status = await jsonResponse(
+                  await fetch(`${apiBase}/ai/generate/video/status/${generationId}`, { headers: bearer(adminToken) }),
+                  'long-video status',
+                );
+                if (status.status === 'COMPLETED' || status.status === 'FAILED') break;
+                await new Promise((resolve) => setTimeout(resolve, 15_000));
+              }
+              assert(status?.status === 'COMPLETED', `Long-video generation did not complete: ${status?.status || 'timeout'} ${status?.errorMessage || ''}`);
+              assert(status.videoUrl, 'Completed long video has no final video URL');
+              const segments = status.metadata?.segments;
+              assert(Array.isArray(segments) && segments.length === 2, 'Completed long video has an invalid segment ledger');
+              assert(segments.every((segment) => segment.status === 'completed' && segment.videoUrl), 'Not every long-video segment completed and transferred');
+              assert(segments[0].lastFrameUrl, 'First segment did not retain the continuation tail frame');
+
+              const usage = await prisma.tokenUsageLog.findMany({
+                where: { userId: adminId, operation: 'video', referenceId: { startsWith: `${generationId}:segment:` } },
+                orderBy: { referenceId: 'asc' },
+                select: { referenceId: true, tokensUsed: true },
+              });
+              assert(usage.length === 2, `Expected two per-segment billing records, got ${usage.length}`);
+              assert(usage[0].tokensUsed === 800 && usage[1].tokensUsed === 800, `Unexpected segment charges: ${usage.map((item) => item.tokensUsed).join(',')}`);
+              assert(usage.reduce((sum, item) => sum + item.tokensUsed, 0) === 1600, 'Admin long-video total charge is not 1600 credits');
+              console.log(JSON.stringify({
+                release: expectedRelease,
+                generationId,
+                status: status.status,
+                segmentCount: segments.length,
+                billingReferences: usage.map((item) => item.referenceId),
+                segmentCharges: usage.map((item) => item.tokensUsed),
+                totalCharged: 1600,
+                finalVideoHost: new URL(status.videoUrl).host,
+              }));
+            })().finally(async () => {
+              await cleanupUser(adminId);
+              await cleanupUser(normalId);
+              await prisma.$disconnect();
+            });
+            NODE
+
+      - name: Record activated production acceptance
+        run: |
+          echo 'release_ledger_status=activated'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
