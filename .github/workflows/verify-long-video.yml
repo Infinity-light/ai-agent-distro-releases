@@ -76,6 +76,7 @@ jobs:
             let adminId = '';
             let normalId = '';
             let generationId = '';
+            let verificationError;
 
             function assert(condition, message) {
               if (!condition) throw new Error(message);
@@ -136,7 +137,10 @@ jobs:
                 secure: true,
               });
               for (const value of urls) {
-                const key = decodeURIComponent(new URL(value).pathname).replace(/^\/+/, '');
+                const url = new URL(value, 'https://zhiduoduoai.com');
+                const key = decodeURIComponent(url.pathname)
+                  .replace(/^\/api\/files\//, '')
+                  .replace(/^\/+/, '');
                 if (!/^(video-segments|videos)\//.test(key)) continue;
                 try { await client.delete(key); } catch (error) {
                   if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
@@ -146,10 +150,8 @@ jobs:
 
             async function cleanupUser(userId) {
               if (!userId) return;
-              const generation = generationId
-                ? await prisma.aiGeneration.findUnique({ where: { id: generationId } })
-                : null;
-              if (generation) await deleteOssObjects(generation);
+              const generations = await prisma.aiGeneration.findMany({ where: { userId } });
+              for (const generation of generations) await deleteOssObjects(generation);
               const conversations = await prisma.aiConversation.findMany({ where: { userId }, select: { id: true } });
               const conversationIds = conversations.map((item) => item.id);
               if (conversationIds.length) await prisma.aiMessage.deleteMany({ where: { conversationId: { in: conversationIds } } });
@@ -166,6 +168,17 @@ jobs:
             (async () => {
               const health = await jsonResponse(await fetch(`${apiBase}/health`), 'production health');
               assert(health.status === 'ok' && health.release === expectedRelease, `Unexpected active release ${health.release}`);
+
+              const staleUsers = await prisma.user.findMany({
+                where: {
+                  OR: [
+                    { phone: { startsWith: 'video-admin-e2e-' } },
+                    { phone: { startsWith: 'video-normal-e2e-' } },
+                  ],
+                },
+                select: { id: true },
+              });
+              for (const user of staleUsers) await cleanupUser(user.id);
 
               const suffix = `${Date.now()}-${process.pid}`;
               const admin = await prisma.user.create({
@@ -259,12 +272,25 @@ jobs:
                 billingReferences: usage.map((item) => item.referenceId),
                 segmentCharges: usage.map((item) => item.tokensUsed),
                 totalCharged: 1600,
-                finalVideoHost: new URL(status.videoUrl).host,
+                finalVideoHost: new URL(status.videoUrl, 'https://zhiduoduoai.com').host,
               }));
-            })().finally(async () => {
-              await cleanupUser(adminId);
-              await cleanupUser(normalId);
-              await prisma.$disconnect();
+            })().catch((error) => {
+              verificationError = error;
+            }).then(async () => {
+              let cleanupError;
+              try {
+                await cleanupUser(adminId);
+                await cleanupUser(normalId);
+              } catch (error) {
+                cleanupError = error;
+              } finally {
+                await prisma.$disconnect();
+              }
+              if (verificationError) {
+                if (cleanupError) console.error(`Cleanup also failed: ${cleanupError.message || cleanupError}`);
+                throw verificationError;
+              }
+              if (cleanupError) throw cleanupError;
             });
             NODE
 
