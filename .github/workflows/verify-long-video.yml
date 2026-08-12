@@ -50,17 +50,25 @@ jobs:
         run: node .github/e2e/production-video-access.cjs
 
       - name: Verify admin Chat long-video and per-segment billing
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
+        shell: bash
         env:
           EXPECTED_RELEASE: ${{ inputs.source_sha }}
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          port: ${{ secrets.SERVER_PORT }}
-          command_timeout: 45m
-          envs: EXPECTED_RELEASE
-          script: |
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+            set -Eeuo pipefail
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sshpass
+            timeout 47m sshpass -p "$SERVER_PASSWORD" ssh \
+              -p "$SERVER_PORT" \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=6 \
+              "$SERVER_USER@$SERVER_HOST" \
+              "EXPECTED_RELEASE='$EXPECTED_RELEASE' bash -se" <<'REMOTE'
             set -Eeuo pipefail
             APP_ROOT=/opt/apps/zhiduoduo-platform
             ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
@@ -322,6 +330,7 @@ jobs:
               if (cleanupError) throw cleanupError;
             });
             NODE
+            REMOTE
 
       - name: Record activated production acceptance
         run: |
