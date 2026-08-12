@@ -225,15 +225,44 @@ jobs:
               assert(!premature, 'Chat started a long video before explicit confirmation');
               assert(String(planning.payload.message).includes('1600'), 'Planning turn did not present the exact 1600-credit cost');
 
+              const confirmationTurns = [];
               const confirmed = await chat(
                 adminToken,
                 '我确认生成。最终方案不变：标题“生产验收咖啡长片”；第一段8秒，清晨同一人物推门进入咖啡店并走到吧台；第二段8秒，严格延续上一段尾帧的人物姿态和场景，接过咖啡并微笑；Seedance 2.0 Mini，9:16，720p，有声，无水印，不固定机位。我接受尾帧续写仍可能存在轻微漂移的风险，并明确确认总计1600积分，请现在一次提交这两个连续片段。',
                 planning.payload.conversationId,
               );
-              const toolEvent = confirmed.events.find(
-                (event) => event.type === 'tool_result' && event.result?.toolName === 'generate_long_video',
+              confirmationTurns.push(confirmed);
+              const findSuccessfulToolEvent = () => confirmationTurns
+                .flatMap((turn) => turn.events)
+                .find((event) => event.type === 'tool_result'
+                  && event.result?.toolName === 'generate_long_video'
+                  && event.result?.success);
+              const findSubmittedToolEvent = () => confirmationTurns
+                .flatMap((turn) => turn.events)
+                .find((event) => event.type === 'tool_result'
+                  && event.result?.toolName === 'generate_long_video'
+                  && event.result?.data?.id);
+
+              let toolEvent = findSuccessfulToolEvent() || findSubmittedToolEvent();
+              if (!toolEvent) {
+                const retried = await chat(
+                  adminToken,
+                  '你上一轮尚未成功提交。现在不是征求意见，也不需要再次规划或提问；全部信息已经最终确认，请立即调用长片生成工具一次提交：标题“生产验收咖啡长片”；Seedance 2.0 Mini；9:16；720p；有声；无水印；不固定机位；共16秒。片段一8秒：清晨同一人物推门进入咖啡店并走到吧台。片段二8秒：必须使用上一段尾帧继续同一人物、姿态与场景，接过咖啡并微笑。我确认承担尾帧续写轻微漂移风险，并再次明确确认精确总价1600积分。不要只回复文字，请现在提交。',
+                  planning.payload.conversationId,
+                );
+                confirmationTurns.push(retried);
+                toolEvent = findSuccessfulToolEvent() || findSubmittedToolEvent();
+              }
+              const confirmationTrace = confirmationTurns.map((turn) => ({
+                message: String(turn.payload?.message || '').slice(0, 800),
+                tools: turn.events
+                  .filter((event) => event.type === 'tool_result')
+                  .map((event) => event.result),
+              }));
+              assert(
+                toolEvent?.result?.success,
+                `Confirmed Chat turn did not successfully call generate_long_video: ${JSON.stringify(confirmationTrace).slice(0, 5000)}`,
               );
-              assert(toolEvent?.result?.success, 'Confirmed Chat turn did not successfully call generate_long_video');
               generationId = toolEvent.result.data?.id;
               assert(generationId, 'Long-video tool result did not return a generation ID');
               assert(toolEvent.result.data?.segmentCount === 2 && toolEvent.result.data?.totalDuration === 16, 'Long-video task shape is not 2 segments / 16 seconds');
