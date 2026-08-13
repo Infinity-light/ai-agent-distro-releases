@@ -29,23 +29,32 @@ jobs:
       - name: Resolve and bind immutable source
         id: source
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_REPO: ${{ github.event.client_payload.repo }}
+          DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+          EVENT_DISPATCH_ID: ${{ github.event.client_payload.dispatch_id }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_REPO: ${{ inputs.repo }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -Eeuo pipefail
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            REF='${{ github.event.client_payload.ref }}'
-            REPO='${{ github.event.client_payload.repo }}'
-            SOURCE_SHA='${{ github.event.client_payload.source_sha }}'
-            DISPATCH_ID='${{ github.event.client_payload.dispatch_id }}'
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            REF="$DISPATCH_REF"
+            REPO="$DISPATCH_REPO"
+            SOURCE_SHA="$DISPATCH_SOURCE_SHA"
+            DISPATCH_ID="$EVENT_DISPATCH_ID"
           else
-            REF='${{ inputs.ref }}'
-            REPO='${{ inputs.repo }}'
-            SOURCE_SHA='${{ inputs.ref }}'
-            DISPATCH_ID="manual-${{ github.run_id }}"
+            REF="$INPUT_REF"
+            REPO="$INPUT_REPO"
+            SOURCE_SHA="$INPUT_REF"
+            DISPATCH_ID="manual-$RUN_ID"
           fi
           test "$REPO" = "Infinity-light/ai-agent-distro"
           [[ "$REF" =~ ^[0-9a-f]{40}$ ]]
           test "$REF" = "$SOURCE_SHA"
-          test -n "$DISPATCH_ID"
+          [[ "$DISPATCH_ID" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
@@ -127,9 +136,18 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then
+            KNOWN_HOST="$SERVER_HOST"
+          else
+            KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"
+          fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
           sshpass -p "$SERVER_PASSWORD" scp \
             -P "$SERVER_PORT" \
-            -o StrictHostKeyChecking=accept-new \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=30 \
             deploy.tar.gz \
             "$SERVER_USER@$SERVER_HOST:/opt/apps/zhiduoduo-platform/deploy.tar.gz"
@@ -158,6 +176,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           port: ${{ secrets.SERVER_PORT }}
+          fingerprint: SHA256:oJIMkirwfTzlFNTrZEh79ZIbjQNe2d6ZZ3V2VffXLb0
           command_timeout: 25m
           envs: RELEASE_ID,DEEPSEEK_API_KEY,GPT_IMAGE_BASE_URL,GPT_IMAGE_API_KEY,OSS_REGION,OSS_ACCESS_KEY_ID,OSS_ACCESS_KEY_SECRET,OSS_BUCKET,ARK_API_KEY,WECHAT_APP_ID,WECHAT_MCH_ID,WECHAT_API_V3_KEY,WECHAT_MCH_SERIAL_NO,WECHAT_PRIVATE_KEY,WECHAT_PUBLIC_KEY,WECHAT_PUBLIC_KEY_ID
           script_path: production-deploy.sh
