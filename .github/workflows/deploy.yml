@@ -146,13 +146,20 @@ jobs:
           OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
           OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          WECHAT_APP_ID: ${{ secrets.WECHAT_APP_ID }}
+          WECHAT_MCH_ID: ${{ secrets.WECHAT_MCH_ID }}
+          WECHAT_API_V3_KEY: ${{ secrets.WECHAT_API_V3_KEY }}
+          WECHAT_MCH_SERIAL_NO: ${{ secrets.WECHAT_MCH_SERIAL_NO }}
+          WECHAT_PRIVATE_KEY: ${{ secrets.WECHAT_PRIVATE_KEY }}
+          WECHAT_PUBLIC_KEY: ${{ secrets.WECHAT_PUBLIC_KEY }}
+          WECHAT_PUBLIC_KEY_ID: ${{ secrets.WECHAT_PUBLIC_KEY_ID }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           port: ${{ secrets.SERVER_PORT }}
           command_timeout: 25m
-          envs: RELEASE_ID,DEEPSEEK_API_KEY,GPT_IMAGE_BASE_URL,GPT_IMAGE_API_KEY,OSS_REGION,OSS_ACCESS_KEY_ID,OSS_ACCESS_KEY_SECRET,OSS_BUCKET,ARK_API_KEY
+          envs: RELEASE_ID,DEEPSEEK_API_KEY,GPT_IMAGE_BASE_URL,GPT_IMAGE_API_KEY,OSS_REGION,OSS_ACCESS_KEY_ID,OSS_ACCESS_KEY_SECRET,OSS_BUCKET,ARK_API_KEY,WECHAT_APP_ID,WECHAT_MCH_ID,WECHAT_API_V3_KEY,WECHAT_MCH_SERIAL_NO,WECHAT_PRIVATE_KEY,WECHAT_PUBLIC_KEY,WECHAT_PUBLIC_KEY_ID
           script_path: production-deploy.sh
 
       - name: Record bound release acceptance
