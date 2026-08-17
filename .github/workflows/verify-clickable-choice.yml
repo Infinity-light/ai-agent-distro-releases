@@ -40,11 +40,11 @@ jobs:
             if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
           '
 
-      - name: Checkout private source at deployed SHA
+      - name: Checkout immutable production UAT harness
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Infinity-light/ai-agent-distro
-          ref: ${{ inputs.source_sha }}
+          ref: 276a5074753da1879751b20556918db6b4adb44c
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           path: source
 
@@ -90,7 +90,34 @@ jobs:
           const { PrismaClient } = require('@prisma/client');
           const jwt = require('jsonwebtoken');
           const prisma = new PrismaClient();
+          const scopedPrefix = 'choice-uat-';
+          async function removeScopedUatUsers() {
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: scopedPrefix } },
+              select: { id: true, phone: true },
+            });
+            if (users.length > 20) throw new Error('Refusing to remove more than 20 scoped UAT users');
+            if (users.some((user) => !user.phone.startsWith(scopedPrefix))) throw new Error('UAT cleanup escaped its phone prefix');
+            const userIds = users.map((user) => user.id);
+            if (!userIds.length) return 0;
+            await prisma.$transaction([
+              prisma.businessProfile.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.creditReservation.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.tokenUsageLog.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.dailyTokenUsage.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiChatAction.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiChatRequest.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiConversation.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiGeneration.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.tokenPack.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.feedback.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.user.deleteMany({ where: { id: { in: userIds }, phone: { startsWith: scopedPrefix } } }),
+            ]);
+            return users.length;
+          }
           (async () => {
+            const removed = await removeScopedUatUsers();
+            if (removed) console.error(`Removed ${removed} stale scoped clickable-choice UAT user(s)`);
             const user = await prisma.user.create({
               data: {
                 phone: process.env.E2E_UAT_PHONE,
@@ -180,20 +207,30 @@ jobs:
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
           const { PrismaClient } = require('@prisma/client');
           const prisma = new PrismaClient();
+          const scopedPrefix = 'choice-uat-';
           (async () => {
-            const selectors = [{ phone: process.env.E2E_UAT_PHONE }];
-            if (process.env.E2E_USER_ID) selectors.push({ id: process.env.E2E_USER_ID });
-            const user = await prisma.user.findFirst({ where: { OR: selectors }, select: { id: true } });
-            if (!user) return;
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: scopedPrefix } },
+              select: { id: true, phone: true },
+            });
+            if (users.length > 20) throw new Error('Refusing to remove more than 20 scoped UAT users');
+            if (users.some((user) => !user.phone.startsWith(scopedPrefix))) throw new Error('UAT cleanup escaped its phone prefix');
+            const userIds = users.map((user) => user.id);
+            if (!userIds.length) return;
             await prisma.$transaction([
-              prisma.creditReservation.deleteMany({ where: { userId: user.id } }),
-              prisma.tokenUsageLog.deleteMany({ where: { userId: user.id } }),
-              prisma.dailyTokenUsage.deleteMany({ where: { userId: user.id } }),
-              prisma.aiConversation.deleteMany({ where: { userId: user.id } }),
-              prisma.aiGeneration.deleteMany({ where: { userId: user.id } }),
-              prisma.tokenPack.deleteMany({ where: { userId: user.id } }),
-              prisma.user.delete({ where: { id: user.id } }),
+              prisma.businessProfile.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.creditReservation.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.tokenUsageLog.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.dailyTokenUsage.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiChatAction.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiChatRequest.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiConversation.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.aiGeneration.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.tokenPack.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.feedback.deleteMany({ where: { userId: { in: userIds } } }),
+              prisma.user.deleteMany({ where: { id: { in: userIds }, phone: { startsWith: scopedPrefix } } }),
             ]);
+            console.log(JSON.stringify({ removedScopedUatUsers: users.length }));
           })().finally(() => prisma.$disconnect());
           NODE
           REMOTE
