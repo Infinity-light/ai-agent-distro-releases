@@ -1,0 +1,689 @@
+name: Verify Zhiduoduo AI Video Director Production
+run-name: "verify ai-video-director ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-ai-video-director-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Validate bound release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install production browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.0
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Create isolated real accounts and OSS-backed materials
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="director-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          uat_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const sharp = require('sharp');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+
+          function assert(condition, message) {
+            if (!condition) throw new Error(message);
+          }
+
+          function tokenFor(user) {
+            return jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '50m' },
+            );
+          }
+
+          async function jsonResponse(response, label) {
+            const body = await response.json();
+            if (!response.ok || (body.code !== undefined && body.code !== 0)) {
+              throw new Error(`${label} failed with ${response.status}: ${JSON.stringify(body).slice(0, 700)}`);
+            }
+            return body.data ?? body;
+          }
+
+          (async () => {
+            const health = await jsonResponse(await fetch(`${apiBase}/health`), 'health');
+            assert(health.release === process.env.EXPECTED_RELEASE, `Active release is ${health.release}`);
+            const suffix = `${process.env.E2E_UAT_PREFIX}-${Date.now()}`;
+            const admin = await prisma.user.create({
+              data: {
+                phone: `${suffix}-admin`,
+                email: `${suffix}-admin@test.local`,
+                passwordHash: 'disabled-production-director-uat',
+                name: 'AI 视频导演生产验收',
+                role: 'PLATFORM_ADMIN',
+                isActivated: true,
+                aiPersona: 'PRODUCT_OWNER',
+                aiOnboardingDone: true,
+                tokenPacks: { create: { name: 'Director UAT Credits', totalTokens: 10000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
+              },
+            });
+            const normal = await prisma.user.create({
+              data: {
+                phone: `${suffix}-normal`,
+                email: `${suffix}-normal@test.local`,
+                passwordHash: 'disabled-production-director-uat',
+                name: '素材越权生产验收',
+                role: 'TERMINAL_USER',
+                isActivated: true,
+                aiPersona: 'PRODUCT_OWNER',
+                aiOnboardingDone: true,
+                tokenPacks: { create: { name: 'Director UAT Normal Credits', totalTokens: 1000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
+              },
+            });
+            const adminToken = tokenFor(admin);
+            const normalToken = tokenFor(normal);
+            const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+              <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f4dfc4"/><stop offset="1" stop-color="#9a5e3a"/></linearGradient></defs>
+              <rect width="512" height="512" fill="url(#bg)"/><ellipse cx="256" cy="415" rx="150" ry="34" fill="#5d3425" opacity=".28"/>
+              <path d="M142 190h216v150c0 55-45 100-100 100h-16c-55 0-100-45-100-100z" fill="#fffaf2"/>
+              <path d="M358 224h30c44 0 61 62 26 87-14 10-31 13-56 13" fill="none" stroke="#fffaf2" stroke-width="28" stroke-linecap="round"/>
+              <ellipse cx="250" cy="194" rx="108" ry="35" fill="#fffaf2"/><ellipse cx="250" cy="198" rx="88" ry="23" fill="#6e3827"/>
+              <path d="M216 147c-18-26 22-37 4-66M265 145c-18-26 22-37 4-66M310 153c-18-26 22-37 4-66" fill="none" stroke="#fff7e8" stroke-width="10" stroke-linecap="round" opacity=".9"/>
+            </svg>`);
+            const png = await sharp(svg).png({ compressionLevel: 9 }).toBuffer();
+            const form = new FormData();
+            form.append('file', new Blob([png], { type: 'image/png' }), 'saved-coffee-reference.png');
+            const uploaded = await jsonResponse(await fetch(`${apiBase}/ai/chat/upload`, {
+              method: 'POST',
+              headers: { authorization: `Bearer ${adminToken}` },
+              body: form,
+            }), 'OSS portrait upload');
+            assert(/^https:\/\//.test(uploaded.url) || /^\/api\/files\//.test(uploaded.url), `Unexpected OSS URL ${uploaded.url}`);
+            await jsonResponse(await fetch(`${apiBase}/ai/chat/profile`, {
+              method: 'PUT',
+              headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+              body: JSON.stringify({
+                profileData: { portraitUrl: uploaded.url, portraitNote: '生产验收真实画像', industry: 'AI 视频营销' },
+                persona: 'PRODUCT_OWNER',
+              }),
+            }), 'profile update');
+            const work = await prisma.aiGeneration.create({
+              data: {
+                userId: admin.id,
+                type: 'POSTER',
+                prompt: '生产验收 OSS 作品素材',
+                result: '生产验收已保存作品',
+                imageUrl: uploaded.url,
+                metadata: { title: '生产验收作品图库', source: 'production-uat' },
+                status: 'COMPLETED',
+              },
+            });
+            const normalWork = await prisma.aiGeneration.create({
+              data: {
+                userId: normal.id,
+                type: 'POSTER',
+                prompt: '另一账号的生产验收素材',
+                result: '另一账号自有作品',
+                imageUrl: uploaded.url,
+                metadata: { title: '另一账号受保护作品', source: 'production-uat' },
+                status: 'COMPLETED',
+              },
+            });
+
+            const model = 'doubao-seedance-2-0-mini-260615';
+            const shots = [
+              { startSeconds: 0, endSeconds: 1, purpose: '钩子', visual: '微距咖啡蒸汽在暖色晨光中升起', camera: '稳定微距轻推' },
+              { startSeconds: 1, endSeconds: 2, purpose: '动作', visual: '光线从左向右扫过白色杯沿', camera: '近景横移' },
+              { startSeconds: 2, endSeconds: 3, purpose: '质感证据', visual: '咖啡液形成细腻涟漪', camera: '俯拍转四十五度' },
+              { startSeconds: 3, endSeconds: 4, purpose: '收束', visual: '完整咖啡杯停在干净暖色桌面中央', camera: '固定近景' },
+            ];
+            const makeArguments = (materialIds) => ({
+              prompt: '以参考图中的白色咖啡杯为唯一产品主体，制作无人物、无文字、无商标的四秒竖屏产品短片。保持杯型、配色和桌面氛围连续一致。',
+              model,
+              duration: 4,
+              ratio: '9:16',
+              resolution: '720p',
+              generateAudio: false,
+              watermark: false,
+              cameraFixed: false,
+              returnLastFrame: true,
+              shots,
+              materialIds,
+              confirmedByUser: true,
+              confirmedCreditCost: 400,
+            });
+            const quote = (title, materialIds, args) => ({
+              type: 'video_quote', mode: 'single', title,
+              model, modelName: 'Seedance 2.0 Mini', ratio: '9:16', resolution: '720p',
+              durations: [4], totalDuration: 4, segmentCredits: [400], totalCreditCost: 400, materialIds,
+              confirmation: { toolName: 'generate_video', arguments: args },
+            });
+            const mainConversation = await prisma.aiConversation.create({
+              data: { userId: admin.id, title: 'AI 视频导演完整生产验收' },
+            });
+            await prisma.aiMessage.create({
+              data: { conversationId: mainConversation.id, role: 'user', content: '请用真实控件帮我完成视频方案选择、确认和素材调用。' },
+            });
+            const createAction = async ({ content, kind, question, options, toolName, quoteData }) => {
+              const assistant = await prisma.aiMessage.create({
+                data: { conversationId: mainConversation.id, role: 'assistant', content },
+              });
+              const payload = {
+                question,
+                multiple: false,
+                options,
+                ...(quoteData ? {
+                  confirmation: quoteData.confirmation,
+                  quote: {
+                    type: quoteData.type, mode: quoteData.mode, title: quoteData.title,
+                    model: quoteData.model, modelName: quoteData.modelName,
+                    ratio: quoteData.ratio, resolution: quoteData.resolution,
+                    durations: quoteData.durations, totalDuration: quoteData.totalDuration,
+                    segmentCredits: quoteData.segmentCredits, totalCreditCost: quoteData.totalCreditCost,
+                    materialIds: quoteData.materialIds,
+                  },
+                } : {}),
+              };
+              return prisma.aiChatAction.create({
+                data: {
+                  userId: admin.id,
+                  conversationId: mainConversation.id,
+                  assistantMessageId: assistant.id,
+                  kind,
+                  toolName: toolName || null,
+                  payload,
+                  expiresAt: new Date(Date.now() + 50 * 60 * 1000),
+                },
+              });
+            };
+            const choiceAction = await createAction({
+              content: '生产 UAT：请选择可追踪的创作目标。',
+              kind: 'CHOICE',
+              question: '这条片子优先解决什么？',
+              options: [
+                { id: 'conversion', label: '转化优先', description: '突出产品动作与明确收束', intent: 'select' },
+                { id: 'brand', label: '品牌优先', description: '突出氛围与记忆点', intent: 'select' },
+              ],
+            });
+            const cancelArgs = makeArguments([]);
+            const cancelQuote = quote('取消控件零扣费验收', [], cancelArgs);
+            const cancelAction = await createAction({
+              content: '这是一份只用于验证取消控件的服务端报价。',
+              kind: 'VIDEO_CONFIRMATION',
+              toolName: 'generate_video',
+              question: '是否取消这份报价而不创建任务？',
+              options: [
+                { id: 'confirm', label: '仍然生成（不用于本项）', description: '按服务端报价生成', intent: 'confirm' },
+                { id: 'cancel', label: '取消生成（UAT）', description: '不创建任务，也不扣视频生成积分', intent: 'cancel' },
+              ],
+              quoteData: cancelQuote,
+            });
+            const denialArgs = makeArguments([`work:${normalWork.id}`]);
+            const denialQuote = quote('跨账号素材拒绝验收', [`work:${normalWork.id}`], denialArgs);
+            const denialAction = await createAction({
+              content: '这份方案故意引用另一账号的作品，系统必须在工具层拒绝。',
+              kind: 'VIDEO_CONFIRMATION',
+              toolName: 'generate_video',
+              question: '确认使用另一账号的素材吗？系统必须拒绝。',
+              options: [
+                { id: 'confirm', label: '确认越权方案（应拒绝）', description: '验证服务端素材所有权', intent: 'confirm' },
+                { id: 'cancel', label: '取消越权方案', description: '不执行', intent: 'cancel' },
+              ],
+              quoteData: denialQuote,
+            });
+            const successArgs = makeArguments([`work:${work.id}`]);
+            const successQuote = quote('自有素材四秒咖啡短片', [`work:${work.id}`], successArgs);
+            const successAction = await createAction({
+              content: '已完成按镜头语义拆分的四秒方案，并使用你个人作品库中的真实 OSS 素材。',
+              kind: 'VIDEO_CONFIRMATION',
+              toolName: 'generate_video',
+              question: '确认使用你自己的作品素材生成 4 秒短视频吗？',
+              options: [
+                { id: 'confirm', label: '确认生成自有素材短片', description: '服务端报价 400 积分', intent: 'confirm' },
+                { id: 'cancel', label: '取消自有素材短片', description: '不创建任务', intent: 'cancel' },
+              ],
+              quoteData: successQuote,
+            });
+            const failedVideo = await prisma.aiGeneration.create({
+              data: {
+                userId: admin.id,
+                type: 'VIDEO',
+                prompt: '生产验收失败任务',
+                result: '视频生成失败',
+                style: 'doubao-seedance-2-0-mini-260615',
+                status: 'FAILED',
+                errorMessage: '生产验收：上游明确返回失败，可安全重试',
+                metadata: {
+                  model: 'doubao-seedance-2-0-mini-260615',
+                  duration: 4,
+                  ratio: '9:16',
+                  resolution: '720p',
+                  generateAudio: false,
+                  watermark: false,
+                  cameraFixed: false,
+                  returnLastFrame: true,
+                  directorBasePrompt: '无人物、无文字、无商标：同一杯咖啡在清晨窗边，四个语义镜头连续完成。',
+                  shots: [
+                    { startSeconds: 0, endSeconds: 1, purpose: '钩子', visual: '特写咖啡蒸汽升起' },
+                    { startSeconds: 1, endSeconds: 2, purpose: '动作', visual: '晨光从左向右扫过咖啡杯沿' },
+                    { startSeconds: 2, endSeconds: 3, purpose: '证据', visual: '窗光扫过杯面纹理' },
+                    { startSeconds: 3, endSeconds: 4, purpose: '收束', visual: '咖啡杯停在干净暖色桌面中央' },
+                  ],
+                  materials: [],
+                  creditCost: 400,
+                  billingMode: 'credits',
+                  pricingMode: 'withoutVideoInput',
+                  providerStatus: 'failed',
+                },
+              },
+            });
+            const failureConversation = await prisma.aiConversation.create({
+              data: { userId: admin.id, title: '失败重试与取消生产验收' },
+            });
+            await prisma.aiMessage.create({
+              data: { conversationId: failureConversation.id, role: 'user', content: '检查真实失败、重试与取消反馈。' },
+            });
+            await prisma.aiMessage.create({
+              data: {
+                conversationId: failureConversation.id,
+                role: 'assistant',
+                content: '上游任务已明确失败；请查看错误并决定是否按原方案新建重试。',
+                attachments: { toolResults: [{ toolName: 'generate_video', success: true, message: '失败任务状态', data: { type: 'video', id: failedVideo.id } }] },
+              },
+            });
+            const materials = await jsonResponse(await fetch(`${apiBase}/ai/chat/materials`, {
+              headers: { authorization: `Bearer ${adminToken}` },
+            }), 'material library');
+            assert(materials.items.some((item) => item.id === 'portrait:primary'), 'Saved portrait is absent');
+            assert(materials.items.some((item) => item.id === `work:${work.id}`), 'Saved work is absent');
+            assert(!materials.items.some((item) => item.id === `work:${normalWork.id}`), 'Another user work leaked into material library');
+            console.log(JSON.stringify({
+              adminId: admin.id,
+              normalId: normal.id,
+              adminToken,
+              normalToken,
+              portraitUrl: uploaded.url,
+              workId: work.id,
+              normalWorkId: normalWork.id,
+              mainConversationId: mainConversation.id,
+              choiceActionId: choiceAction.id,
+              cancelActionId: cancelAction.id,
+              denialActionId: denialAction.id,
+              successActionId: successAction.id,
+              failedVideoId: failedVideo.id,
+              failureConversationId: failureConversation.id,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          E2E_ADMIN_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).adminId)')
+          E2E_NORMAL_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).normalId)')
+          E2E_ADMIN_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).adminToken)')
+          E2E_NORMAL_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).normalToken)')
+          E2E_PORTRAIT_URL=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).portraitUrl)')
+          E2E_WORK_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).workId)')
+          E2E_NORMAL_WORK_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).normalWorkId)')
+          E2E_MAIN_CONVERSATION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).mainConversationId)')
+          E2E_CHOICE_ACTION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).choiceActionId)')
+          E2E_CANCEL_ACTION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).cancelActionId)')
+          E2E_DENIAL_ACTION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).denialActionId)')
+          E2E_SUCCESS_ACTION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).successActionId)')
+          E2E_FAILED_VIDEO_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).failedVideoId)')
+          E2E_FAILURE_CONVERSATION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).failureConversationId)')
+          echo "::add-mask::$E2E_ADMIN_TOKEN"
+          echo "::add-mask::$E2E_NORMAL_TOKEN"
+          for value in E2E_ADMIN_ID E2E_NORMAL_ID E2E_ADMIN_TOKEN E2E_NORMAL_TOKEN E2E_PORTRAIT_URL E2E_WORK_ID E2E_NORMAL_WORK_ID E2E_MAIN_CONVERSATION_ID E2E_CHOICE_ACTION_ID E2E_CANCEL_ACTION_ID E2E_DENIAL_ACTION_ID E2E_SUCCESS_ACTION_ID E2E_FAILED_VIDEO_ID E2E_FAILURE_CONVERSATION_ID; do
+            echo "$value=${!value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Run complete real-account production UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          E2E_EVIDENCE_DIR: uat-artifacts
+        run: node .github/e2e/production-ai-video-director.cjs
+
+      - name: Collect server-side model, action, billing, and task ledger
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_ADMIN_ID:-}" ]; then
+            printf '{"collection":"skipped","reason":"account setup did not complete"}\n' > uat-artifacts/server-ledger.json
+            exit 0
+          fi
+          if [ -z "${E2E_SUCCESS_GENERATION_ID:-}" ] || [ -z "${E2E_RETRY_GENERATION_ID:-}" ]; then
+            printf '{"collection":"skipped","reason":"browser UAT did not reach both task IDs"}\n' > uat-artifacts/server-ledger.json
+            exit 0
+          fi
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_ADMIN_ID='$E2E_ADMIN_ID' E2E_WORK_ID='$E2E_WORK_ID' E2E_FAILED_VIDEO_ID='$E2E_FAILED_VIDEO_ID' E2E_SUCCESS_GENERATION_ID='$E2E_SUCCESS_GENERATION_ID' E2E_RETRY_GENERATION_ID='$E2E_RETRY_GENERATION_ID' E2E_CHOICE_ACTION_ID='$E2E_CHOICE_ACTION_ID' E2E_CANCEL_ACTION_ID='$E2E_CANCEL_ACTION_ID' E2E_DENIAL_ACTION_ID='$E2E_DENIAL_ACTION_ID' E2E_SUCCESS_ACTION_ID='$E2E_SUCCESS_ACTION_ID' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          (async () => {
+            const userId = process.env.E2E_ADMIN_ID;
+            const [actions, generations, usage, reservations, messages, packs, user] = await Promise.all([
+              prisma.aiChatAction.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.aiGeneration.findMany({ where: { userId }, orderBy: { createdAt: 'asc' }),
+              prisma.tokenUsageLog.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.creditReservation.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.aiMessage.findMany({ where: { conversation: { userId } }, orderBy: { createdAt: 'asc' } }),
+              prisma.tokenPack.findMany({ where: { userId }, orderBy: { purchasedAt: 'asc' } }),
+              prisma.user.findUnique({ where: { id: userId }, select: { aiProfileData: true } }),
+            ]);
+            const action = id => actions.find(item => item.id === id);
+            const generation = id => generations.find(item => item.id === id);
+            const models = [...new Set(usage.map((entry) => entry.model).filter(Boolean))];
+            assert(models.includes('DeepSeek-V4-Flash'), `Expected DeepSeek-V4-Flash telemetry, got ${models.join(', ')}`);
+            const choice = action(process.env.E2E_CHOICE_ACTION_ID);
+            const cancelled = action(process.env.E2E_CANCEL_ACTION_ID);
+            const denied = action(process.env.E2E_DENIAL_ACTION_ID);
+            const confirmed = action(process.env.E2E_SUCCESS_ACTION_ID);
+            assert(choice?.status === 'COMPLETED' && choice.attempts === 1, `Choice action state ${choice?.status}/${choice?.attempts}`);
+            assert(JSON.stringify(choice.selectedOptionIds) === JSON.stringify(['conversion']), `Choice selection ${JSON.stringify(choice?.selectedOptionIds)}`);
+            assert(cancelled?.status === 'CANCELLED' && cancelled.attempts === 1, `Cancel action state ${cancelled?.status}/${cancelled?.attempts}`);
+            assert(denied?.status === 'FAILED' && denied.attempts === 1, `Denied action state ${denied?.status}/${denied?.attempts}`);
+            assert(/无权|不在你的可用素材库/.test(denied.errorMessage || ''), `Denied action feedback ${denied?.errorMessage}`);
+            assert(confirmed?.status === 'COMPLETED' && confirmed.attempts === 1, `Confirmed action state ${confirmed?.status}/${confirmed?.attempts}`);
+            assert(confirmed.payload?.quote?.materialIds?.[0] === `work:${process.env.E2E_WORK_ID}`, 'Confirmed action lost the stable work material reference');
+            assert(!generations.some(item => item.operationKey === `chat-action:${cancelled.id}`), 'Cancelled confirmation created a generation');
+            assert(!generations.some(item => item.operationKey === `chat-action:${denied.id}`), 'Denied confirmation created a generation');
+
+            const successfulVideo = generation(process.env.E2E_SUCCESS_GENERATION_ID);
+            const failedVideo = generation(process.env.E2E_FAILED_VIDEO_ID);
+            const retryVideo = generation(process.env.E2E_RETRY_GENERATION_ID);
+            assert(successfulVideo?.status === 'COMPLETED' && successfulVideo.videoUrl, `Successful task ${successfulVideo?.status}`);
+            assert(successfulVideo.providerTaskId, 'Successful task has no provider task ID');
+            assert(successfulVideo.operationKey === `chat-action:${confirmed.id}`, `Successful operation key ${successfulVideo.operationKey}`);
+            assert(successfulVideo.metadata?.providerSubmission?.clientRequestId, 'Successful task has no provider client request ID');
+            const shotDurations = Array.isArray(successfulVideo.metadata?.shots)
+              ? successfulVideo.metadata.shots.map(shot => Number(shot.endSeconds) - Number(shot.startSeconds))
+              : [];
+            assert(shotDurations.length === 4 && shotDurations.every(duration => duration > 0 && duration <= 2),
+              `Semantic shot durations ${JSON.stringify(shotDurations)}`);
+            assert(Array.isArray(successfulVideo.metadata?.materials) && successfulVideo.metadata.materials.length === 1,
+              'Successful task did not retain its one resolved source material');
+            assert(failedVideo?.status === 'FAILED' && !failedVideo.providerTaskId, 'Seeded failed task changed unexpectedly');
+            assert(retryVideo?.status === 'CANCELLED', `Retried task status ${retryVideo?.status}`);
+            assert(retryVideo.providerTaskId, 'Cancelled retry never reached a real provider task');
+            assert(retryVideo.metadata?.providerStatus === 'cancelled', `Cancelled provider state ${retryVideo.metadata?.providerStatus}`);
+            assert(!generations.some(item => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status)), 'An active or orphan application task remains');
+
+            const successUsage = usage.filter(item => item.referenceId === successfulVideo.id);
+            assert(successUsage.length === 1, `Successful video usage rows ${successUsage.length}`);
+            assert(successUsage[0].tokensUsed === 400 && successUsage[0].businessType === 'VIDEO',
+              `Successful video usage ${successUsage[0]?.tokensUsed}/${successUsage[0]?.businessType}`);
+            assert(successUsage[0].costStatus === 'PRICED' && successUsage[0].pricingVersionId,
+              `Successful video cost state ${successUsage[0]?.costStatus}/${successUsage[0]?.pricingVersionId}`);
+            assert(!usage.some(item => [failedVideo.id, retryVideo.id].includes(item.referenceId)), 'Failed or cancelled task consumed credits');
+            assert(!reservations.some(item => [failedVideo.id, retryVideo.id, successfulVideo.id].includes(item.referenceId)), 'A video reservation remains');
+            const persistedImageOnly = messages.find(message => (
+              message.role === 'user'
+              && message.content === ''
+              && Array.isArray(message.attachments)
+              && message.attachments.some(item => item.type === 'material_ref' && item.materialId === 'portrait:primary')
+            ));
+            assert(persistedImageOnly, 'Image-only saved material message is missing from the ledger');
+            const charged = usage.reduce((sum, item) => sum + item.tokensUsed, 0);
+            assert(packs.reduce((sum, pack) => sum + pack.usedTokens, 0) === charged,
+              `Token pack total does not reconcile to immutable usage ${charged}`);
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              userId,
+              portraitConfigured: Boolean(user?.aiProfileData?.portraitUrl),
+              models,
+              actions: actions.map(item => ({
+                id: item.id, kind: item.kind, status: item.status, attempts: item.attempts,
+                retryable: item.retryable, selectedOptionIds: item.selectedOptionIds,
+                invocationKey: item.invocationKey, errorCode: item.errorCode, errorMessage: item.errorMessage,
+                stableMaterialIds: item.payload?.quote?.materialIds || [],
+              })),
+              generations: generations.map((entry) => ({
+                id: entry.id,
+                type: entry.type,
+                status: entry.status,
+                providerTaskId: entry.providerTaskId,
+                hasVideoUrl: Boolean(entry.videoUrl),
+                videoHost: entry.videoUrl ? new URL(entry.videoUrl, 'https://zhiduoduoai.com').host : null,
+                errorMessage: entry.errorMessage,
+                operationKey: entry.operationKey,
+                stage: entry.metadata?.providerStatus || null,
+                inboundRequestId: entry.metadata?.inboundRequestId || null,
+                providerSubmission: entry.metadata?.providerSubmission || null,
+                shots: entry.metadata?.shots || [],
+              })),
+              imageOnlyUserMessageId: persistedImageOnly.id,
+              usage: usage.map(item => ({
+                id: item.id, operation: item.operation, referenceId: item.referenceId,
+                model: item.model, provider: item.provider, providerEndpoint: item.providerEndpoint,
+                providerRequestId: item.providerRequestId, tokensUsed: item.tokensUsed,
+                businessType: item.businessType, costStatus: item.costStatus,
+                pricingVersionId: item.pricingVersionId, inputTokens: item.inputTokens,
+                outputTokens: item.outputTokens, durationMs: item.durationMs,
+              })),
+              reservationCount: reservations.length,
+              chargedCredits: charged,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/server-ledger.json
+
+      - name: Remove isolated accounts, tasks, and OSS objects
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '{"cleanup":"skipped","reason":"no UAT identity allocated"}\n' | tee uat-artifacts/cleanup-evidence.json
+            exit 0
+          fi
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          function collectStrings(value, output = []) {
+            if (typeof value === 'string') output.push(value);
+            else if (Array.isArray(value)) value.forEach((item) => collectStrings(item, output));
+            else if (value && typeof value === 'object') Object.values(value).forEach((item) => collectStrings(item, output));
+            return output;
+          }
+
+          function tokenFor(user) {
+            return jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '10m' },
+            );
+          }
+
+          async function cleanupUser(user) {
+            const token = tokenFor(user);
+            const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+            let generations = await prisma.aiGeneration.findMany({ where: { userId: user.id } });
+            for (const generation of generations.filter(item => ['PENDING', 'CANCEL_REQUESTED'].includes(item.status) && item.type === 'VIDEO')) {
+              try { await fetch(`${apiBase}/ai/generate/video/${generation.id}/cancel`, { method: 'POST', headers, body: '{}' }); } catch {}
+            }
+            const terminalDeadline = Date.now() + 5 * 60_000;
+            while (Date.now() < terminalDeadline) {
+              generations = await prisma.aiGeneration.findMany({ where: { userId: user.id } });
+              if (generations.every(item => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status))) break;
+              await sleep(5000);
+            }
+            const active = generations.filter(item => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status));
+            if (active.length) throw new Error(`Refusing cleanup while tasks are active: ${active.map(item => `${item.id}:${item.status}`).join(',')}`);
+            const [messages, freshUser] = await Promise.all([
+              prisma.aiMessage.findMany({ where: { conversation: { userId: user.id } }, select: { attachments: true } }),
+              prisma.user.findUnique({ where: { id: user.id }, select: { aiProfileData: true } }),
+            ]);
+            const urls = [
+              ...collectStrings(freshUser?.aiProfileData),
+              ...messages.flatMap((message) => collectStrings(message.attachments)),
+              ...generations.flatMap((generation) => collectStrings({ imageUrl: generation.imageUrl, videoUrl: generation.videoUrl, metadata: generation.metadata })),
+            ].filter((value) => /^https?:\/\//.test(value) || /^\/api\/files\//.test(value));
+            let deletedOssObjects = 0;
+            if (process.env.OSS_REGION && process.env.OSS_ACCESS_KEY_ID && process.env.OSS_ACCESS_KEY_SECRET && process.env.OSS_BUCKET) {
+              const OSS = require('ali-oss');
+              const client = new OSS({
+                region: process.env.OSS_REGION,
+                accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+                accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+                bucket: process.env.OSS_BUCKET,
+                secure: true,
+              });
+              for (const value of [...new Set(urls)]) {
+                let key;
+                try {
+                  key = decodeURIComponent(new URL(value, 'https://zhiduoduoai.com').pathname).replace(/^\/api\/files\//, '').replace(/^\/+/, '');
+                } catch { continue; }
+                if (!/^(chat|videos|video-segments|video-materials)\//.test(key)) continue;
+                try { await client.delete(key); deletedOssObjects += 1; } catch (error) {
+                  if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
+                }
+              }
+            }
+            await prisma.aiChatAction.deleteMany({ where: { userId: user.id } });
+            await prisma.aiMessage.deleteMany({ where: { conversation: { userId: user.id } } });
+            await prisma.aiConversation.deleteMany({ where: { userId: user.id } });
+            await prisma.aiGeneration.updateMany({ where: { userId: user.id }, data: { relatedId: null } });
+            await prisma.tokenUsageLog.deleteMany({ where: { userId: user.id } });
+            await prisma.creditReservation.deleteMany({ where: { userId: user.id } });
+            await prisma.dailyTokenUsage.deleteMany({ where: { userId: user.id } });
+            const grants = await prisma.creditGrant.findMany({ where: { userId: user.id }, select: { id: true } });
+            if (grants.length) await prisma.creditGrantEvent.deleteMany({ where: { grantId: { in: grants.map(item => item.id) } } });
+            await prisma.creditGrant.deleteMany({ where: { userId: user.id } });
+            await prisma.aiGeneration.deleteMany({ where: { userId: user.id } });
+            await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
+            await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
+            await prisma.user.delete({ where: { id: user.id } });
+            return { userId: user.id, generationCount: generations.length, deletedOssObjects };
+          }
+
+          (async () => {
+            const users = await prisma.user.findMany({ where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } } });
+            const removed = [];
+            for (const user of users) removed.push(await cleanupUser(user));
+            console.log(JSON.stringify({ removed, accountCount: users.length, cleanupComplete: true }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/cleanup-evidence.json
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ai-video-director-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record activated production acceptance
+        if: success()
+        run: |
+          echo 'production_ai_video_director_uat=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'verification_url=https://zhiduoduoai.com/chat'
