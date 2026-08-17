@@ -1,0 +1,342 @@
+name: Verify Video Incident Recovery Production
+run-name: "verify video-recovery ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Validate bound production release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Bound deployment does not contain source SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install production browser runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.0
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Create isolated real production administrator account
+        shell: bash
+        env:
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          uat_phone="video-recovery-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "UAT_PHONE=$uat_phone" >> "$GITHUB_ENV"
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=4 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$EXPECTED_RELEASE' UAT_PHONE='$uat_phone' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          (async () => {
+            const healthResponse = await fetch('http://127.0.0.1:3100/api/health');
+            const healthBody = await healthResponse.json();
+            const health = healthBody.data || healthBody;
+            if (!healthResponse.ok || health.status !== 'ok' || health.release !== process.env.EXPECTED_RELEASE) {
+              throw new Error(`Unexpected production health: ${JSON.stringify(health)}`);
+            }
+            const existing = await prisma.user.findUnique({ where: { phone: process.env.UAT_PHONE } });
+            if (existing) throw new Error(`UAT identity already exists: ${existing.id}`);
+            const user = await prisma.user.create({
+              data: {
+                phone: process.env.UAT_PHONE,
+                email: `${process.env.UAT_PHONE}@test.local`,
+                passwordHash: 'disabled-production-video-recovery-uat',
+                name: 'Video Recovery Production UAT',
+                role: 'PLATFORM_ADMIN',
+                isActivated: true,
+                aiOnboardingDone: true,
+                tokenPacks: {
+                  create: { name: 'Video Recovery UAT Credits', totalTokens: 5000, usedTokens: 0, price: 0, status: 'ACTIVE' },
+                },
+              },
+            });
+            const token = jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '35m' },
+            );
+            console.log(JSON.stringify({ userId: user.id, token }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          account=$(printf '%s\n' "$output" | tail -n 1)
+          token=$(ACCOUNT="$account" node -e 'process.stdout.write(JSON.parse(process.env.ACCOUNT).token)')
+          user_id=$(ACCOUNT="$account" node -e 'process.stdout.write(JSON.parse(process.env.ACCOUNT).userId)')
+          echo "::add-mask::$token"
+          echo "E2E_TOKEN=$token" >> "$GITHUB_ENV"
+          echo "UAT_USER_ID=$user_id" >> "$GITHUB_ENV"
+          echo "Created isolated production account $user_id"
+
+      - name: Reproduce provider failure, prove zero charge, and complete a real short video
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          E2E_EVIDENCE_DIR: uat-artifacts
+        run: node .github/e2e/production-video-incident-recovery.cjs
+
+      - name: Verify production task, provider, and immutable credit ledger
+        shell: bash
+        env:
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$EXPECTED_RELEASE' UAT_PHONE='$UAT_PHONE' FAILED_ID='$UAT_FAILED_GENERATION_ID' COMPLETED_ID='$UAT_COMPLETED_GENERATION_ID' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          (async () => {
+            const user = await prisma.user.findUnique({ where: { phone: process.env.UAT_PHONE } });
+            assert(user, 'UAT account not found');
+            const [failed, completed, usages, reservations, packs] = await Promise.all([
+              prisma.aiGeneration.findFirst({ where: { id: process.env.FAILED_ID, userId: user.id } }),
+              prisma.aiGeneration.findFirst({ where: { id: process.env.COMPLETED_ID, userId: user.id } }),
+              prisma.tokenUsageLog.findMany({
+                where: { userId: user.id, referenceId: { in: [process.env.FAILED_ID, process.env.COMPLETED_ID] } },
+                orderBy: { createdAt: 'asc' },
+              }),
+              prisma.creditReservation.findMany({
+                where: { userId: user.id, referenceId: { in: [process.env.FAILED_ID, process.env.COMPLETED_ID] } },
+              }),
+              prisma.tokenPack.findMany({ where: { userId: user.id } }),
+            ]);
+            const failedMeta = failed?.metadata && typeof failed.metadata === 'object' ? failed.metadata : {};
+            const completedMeta = completed?.metadata && typeof completed.metadata === 'object' ? completed.metadata : {};
+            assert(failed?.status === 'FAILED', `Rejected task status is ${failed?.status}`);
+            assert(!failed.providerTaskId, `Rejected task has orphan provider task ${failed.providerTaskId}`);
+            assert(failedMeta.providerStatus === 'rejected', `Rejected task provider status is ${failedMeta.providerStatus}`);
+            assert(failedMeta.inboundRequestId, 'Rejected task has no inbound request ID');
+            assert(failedMeta.providerFailure?.clientRequestId, 'Rejected task has no outbound request ID');
+            assert(failedMeta.providerFailure?.originalMessage, 'Rejected task has no provider raw error evidence');
+            assert(!usages.some(item => item.referenceId === failed.id), 'Rejected task has a usage charge');
+            assert(!reservations.some(item => item.referenceId === failed.id), 'Rejected task has a credit reservation');
+
+            assert(completed?.status === 'COMPLETED', `Successful task status is ${completed?.status}`);
+            assert(completed.providerTaskId, 'Successful task has no provider task ID');
+            assert(completed.videoUrl, 'Successful task has no stored video URL');
+            assert(completedMeta.inboundRequestId, 'Successful task has no inbound request ID');
+            assert(completedMeta.providerSubmission?.clientRequestId, 'Successful task has no outbound request ID');
+            const completedUsage = usages.filter(item => item.referenceId === completed.id);
+            assert(completedUsage.length === 1, `Expected one completed usage record, got ${completedUsage.length}`);
+            assert(completedUsage[0].tokensUsed === 400, `Expected 400 charged credits, got ${completedUsage[0].tokensUsed}`);
+            assert(completedUsage[0].businessType === 'VIDEO', `Usage business type is ${completedUsage[0].businessType}`);
+            assert(completedUsage[0].costStatus === 'PRICED', `Usage cost status is ${completedUsage[0].costStatus}`);
+            assert(reservations.length === 0, `Short-video UAT left ${reservations.length} reservations`);
+            assert(packs.length === 1 && packs[0].usedTokens === 400, `Token pack usage is ${packs.map(item => item.usedTokens).join(',')}`);
+
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              userId: user.id,
+              failed: {
+                generationId: failed.id,
+                status: failed.status,
+                providerTaskId: failed.providerTaskId,
+                inboundRequestId: failedMeta.inboundRequestId,
+                providerFailure: failedMeta.providerFailure,
+                chargedCredits: 0,
+                reservationCount: 0,
+              },
+              completed: {
+                generationId: completed.id,
+                status: completed.status,
+                providerTaskId: completed.providerTaskId,
+                inboundRequestId: completedMeta.inboundRequestId,
+                providerSubmission: completedMeta.providerSubmission,
+                chargedCredits: completedUsage[0].tokensUsed,
+                costStatus: completedUsage[0].costStatus,
+                pricingVersionId: completedUsage[0].pricingVersionId,
+              },
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/production-ledger-evidence.json
+
+      - name: Clean isolated account and generated OSS evidence
+        if: always()
+        shell: bash
+        env:
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          test -n "${UAT_PHONE:-}"
+          mkdir -p uat-artifacts
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$EXPECTED_RELEASE' UAT_PHONE='$UAT_PHONE' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          async function deleteOssObjects(generations) {
+            if (!process.env.OSS_REGION || !process.env.OSS_ACCESS_KEY_ID || !process.env.OSS_ACCESS_KEY_SECRET || !process.env.OSS_BUCKET) return 0;
+            const OSS = require('ali-oss');
+            const client = new OSS({
+              region: process.env.OSS_REGION,
+              accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+              accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+              bucket: process.env.OSS_BUCKET,
+              secure: true,
+            });
+            let deleted = 0;
+            for (const generation of generations) {
+              const meta = generation.metadata && typeof generation.metadata === 'object' ? generation.metadata : {};
+              const urls = [generation.videoUrl, ...(Array.isArray(meta.segments) ? meta.segments.map(item => item.videoUrl) : [])].filter(Boolean);
+              for (const value of urls) {
+                const url = new URL(value, 'https://zhiduoduoai.com');
+                const key = decodeURIComponent(url.pathname).replace(/^\/api\/files\//, '').replace(/^\/+/, '');
+                if (!/^(videos|video-segments)\//.test(key)) continue;
+                try { await client.delete(key); deleted += 1; } catch (error) {
+                  if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
+                }
+              }
+            }
+            return deleted;
+          }
+          (async () => {
+            const user = await prisma.user.findUnique({ where: { phone: process.env.UAT_PHONE } });
+            if (!user) {
+              console.log(JSON.stringify({ userAlreadyAbsent: true, phone: process.env.UAT_PHONE }));
+              return;
+            }
+            const token = jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '8m' },
+            );
+            const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+            let generations = await prisma.aiGeneration.findMany({ where: { userId: user.id } });
+            for (const generation of generations.filter(item => ['PENDING', 'CANCEL_REQUESTED'].includes(item.status))) {
+              await fetch(`${apiBase}/ai/generate/video/${generation.id}/cancel`, { method: 'POST', headers, body: '{}' }).catch(() => {});
+            }
+            const terminalDeadline = Date.now() + 5 * 60_000;
+            while (Date.now() < terminalDeadline) {
+              generations = await prisma.aiGeneration.findMany({ where: { userId: user.id } });
+              if (generations.every(item => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status))) break;
+              await sleep(5000);
+            }
+            const active = generations.filter(item => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status));
+            if (active.length) throw new Error(`Refusing cleanup while tasks are active: ${active.map(item => `${item.id}:${item.status}`).join(',')}`);
+            const deletedOssObjects = await deleteOssObjects(generations);
+            const conversations = await prisma.aiConversation.findMany({ where: { userId: user.id }, select: { id: true } });
+            const conversationIds = conversations.map(item => item.id);
+            await prisma.aiChatAction.deleteMany({ where: { userId: user.id } });
+            if (conversationIds.length) await prisma.aiMessage.deleteMany({ where: { conversationId: { in: conversationIds } } });
+            await prisma.aiConversation.deleteMany({ where: { userId: user.id } });
+            await prisma.aiGeneration.updateMany({ where: { userId: user.id }, data: { relatedId: null } });
+            await prisma.tokenUsageLog.deleteMany({ where: { userId: user.id } });
+            await prisma.creditReservation.deleteMany({ where: { userId: user.id } });
+            await prisma.dailyTokenUsage.deleteMany({ where: { userId: user.id } });
+            const grants = await prisma.creditGrant.findMany({ where: { userId: user.id }, select: { id: true } });
+            if (grants.length) await prisma.creditGrantEvent.deleteMany({ where: { grantId: { in: grants.map(item => item.id) } } });
+            await prisma.creditGrant.deleteMany({ where: { userId: user.id } });
+            await prisma.aiGeneration.deleteMany({ where: { userId: user.id } });
+            await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
+            await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
+            await prisma.user.delete({ where: { id: user.id } });
+            console.log(JSON.stringify({ userId: user.id, deletedGenerations: generations.length, deletedOssObjects, accountDeleted: true }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/cleanup-evidence.json
+
+      - name: Upload production recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-incident-recovery-${{ inputs.source_sha }}
+          path: uat-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Record production acceptance
+        if: success()
+        run: |
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'verification_url=https://zhiduoduoai.com/video'
+          echo 'failure_billing_delta=0'
+          echo 'short_video_terminal_status=COMPLETED'
