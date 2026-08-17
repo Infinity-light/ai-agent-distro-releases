@@ -48,20 +48,6 @@ async function json(response, label, allowFailure = false) {
   return body;
 }
 
-function parseSse(text) {
-  return text
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => {
-      try {
-        return JSON.parse(line.slice(6));
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-}
-
 async function balance(api) {
   const data = unwrap(
     await json(
@@ -312,16 +298,14 @@ function appendGithubEnv(name, value) {
       imageOnlyResponse.status() === 200,
       `Image-only stream returned ${imageOnlyResponse.status()}`,
     );
-    const streamEvents = parseSse(await imageOnlyResponse.text());
-    const streamError = streamEvents.find((event) => event.type === "error");
-    const streamDone = streamEvents.findLast((event) => event.type === "done");
+    // SSE responses are consumed incrementally by the page. Chromium can
+    // discard their buffered body after completion, so Network.getResponseBody
+    // is not a reliable acceptance oracle. Wait for transport completion, then
+    // assert the application's durable conversation state instead.
+    const streamTransportError = await imageOnlyResponse.finished();
     assert(
-      !streamError,
-      `Image-only stream failed: ${JSON.stringify(streamError)}`,
-    );
-    assert(
-      streamDone?.payload?.assistantMessageId,
-      "Image-only stream did not produce a persisted assistant message",
+      !streamTransportError,
+      `Image-only stream transport failed: ${streamTransportError?.message || streamTransportError}`,
     );
     const conversationAfterImage = unwrap(
       await json(
@@ -331,28 +315,36 @@ function appendGithubEnv(name, value) {
         "conversation after image-only send",
       ),
     );
-    const imageOnlyUserMessage = [...conversationAfterImage.messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "user" &&
-          message.content === "" &&
-          Array.isArray(message.attachments) &&
-          message.attachments.some(
-            (item) =>
-              item.type === "material_ref" &&
-              item.materialId === "portrait:primary",
-          ),
-      );
+    const imageOnlyUserIndex = conversationAfterImage.messages.findLastIndex(
+      (message) =>
+        message.role === "user" &&
+        message.content === "" &&
+        Array.isArray(message.attachments) &&
+        message.attachments.some(
+          (item) =>
+            item.type === "material_ref" &&
+            item.materialId === "portrait:primary",
+        ),
+    );
+    const imageOnlyUserMessage =
+      conversationAfterImage.messages[imageOnlyUserIndex];
+    const imageOnlyAssistantMessage = conversationAfterImage.messages
+      .slice(imageOnlyUserIndex + 1)
+      .find((message) => message.role === "assistant");
     assert(
       imageOnlyUserMessage,
       "Image-only material reference was not persisted on the user message",
     );
+    assert(
+      imageOnlyAssistantMessage?.id && imageOnlyAssistantMessage.content,
+      "Image-only stream did not produce a persisted assistant message",
+    );
     evidence.imageOnly = {
       requestBody: imageOnlyBody,
-      assistantMessageId: streamDone.payload.assistantMessageId,
+      assistantMessageId: imageOnlyAssistantMessage.id,
       persistedUserMessageId: imageOnlyUserMessage.id,
-      streamEventTypes: streamEvents.map((event) => event.type),
+      streamHttpStatus: imageOnlyResponse.status(),
+      durableCompletion: true,
     };
     await page.screenshot({
       path: path.join(evidenceDir, "02-image-only-real-deepseek-response.png"),
