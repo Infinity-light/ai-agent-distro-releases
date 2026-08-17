@@ -1,0 +1,244 @@
+name: Diagnose Zhiduoduo Video Production Incident
+run-name: "diagnose video ${{ inputs.source_sha }} [${{ inputs.window_minutes }}m]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Active immutable production release SHA
+        required: true
+      window_minutes:
+        description: Read-only evidence window in minutes
+        required: true
+        default: '30'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zhiduoduo-video-incident-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Collect sanitized API, task, provider, and billing evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WINDOW_MINUTES: ${{ inputs.window_minutes }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WINDOW_MINUTES" =~ ^[0-9]+$ ]]
+          test "$WINDOW_MINUTES" -ge 1
+          test "$WINDOW_MINUTES" -le 180
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh" incident-artifacts
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' WINDOW_MINUTES='$WINDOW_MINUTES' bash -se" > incident-artifacts/video-incident-evidence.json <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const prisma = new PrismaClient();
+          const windowMinutes = Number(process.env.WINDOW_MINUTES);
+          const collectedAt = new Date();
+          const since = new Date(collectedAt.getTime() - windowMinutes * 60_000);
+
+          function pseudonym(value) {
+            return value ? crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12) : null;
+          }
+
+          function sanitize(value) {
+            return String(value || '')
+              .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+              .replace(/([?&](?:token|signature|x-oss-signature|access_key_id)=)[^&\s]+/gi, '$1[REDACTED]')
+              .replace(/\b1[3-9]\d{9}\b/g, '[PHONE]')
+              .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
+              .slice(0, 1200);
+          }
+
+          function readTail(file, maxBytes = 4 * 1024 * 1024) {
+            try {
+              const stat = fs.statSync(file);
+              const length = Math.min(stat.size, maxBytes);
+              const buffer = Buffer.alloc(length);
+              const fd = fs.openSync(file, 'r');
+              fs.readSync(fd, buffer, 0, length, stat.size - length);
+              fs.closeSync(fd);
+              return buffer.toString('utf8');
+            } catch {
+              return '';
+            }
+          }
+
+          function relevantAppLogs() {
+            const logDir = path.join(os.homedir(), '.pm2', 'logs');
+            const files = ['zhiduoduo-platform-error.log', 'zhiduoduo-platform-out.log'];
+            return files.flatMap((name) => readTail(path.join(logDir, name)).split(/\r?\n/)
+              .filter((line) => /Seedance|VideoGeneration|video task|视频|BadGateway|request failed|provider/i.test(line))
+              .slice(-250)
+              .map((line) => ({ source: name, line: sanitize(line) })));
+          }
+
+          function relevantNginxLogs() {
+            return readTail('/var/log/nginx/access.log').split(/\r?\n/).flatMap((line) => {
+              if (!/\/(?:api\/)?(?:ai\/generate\/video|ai\/chat\/actions\/)/.test(line)) return [];
+              const match = line.match(/^\S+\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([A-Z]+)\s+([^\s]+)\s+HTTP\/[^"]+"\s+(\d{3})\s+(\d+)/);
+              if (!match) return [{ raw: sanitize(line.replace(/^\S+/, '[IP]')) }];
+              const [, timestamp, method, rawPath, status, bytes] = match;
+              const cleanPath = rawPath.replace(/\?.*$/, '');
+              return [{ timestamp, method, path: cleanPath, status: Number(status), bytes: Number(bytes) }];
+            }).slice(-500);
+          }
+
+          async function providerState(taskId) {
+            if (!process.env.ARK_API_KEY || !taskId) return { taskId, skipped: 'missing key or task id' };
+            const baseUrl = (process.env.SEEDANCE_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/+$/, '');
+            try {
+              const response = await fetch(`${baseUrl}/contents/generations/tasks/${encodeURIComponent(taskId)}`, {
+                headers: { authorization: `Bearer ${process.env.ARK_API_KEY}` },
+                signal: AbortSignal.timeout(30_000),
+              });
+              const raw = await response.text();
+              let body;
+              try { body = JSON.parse(raw); } catch { body = { raw: sanitize(raw) }; }
+              const error = body?.error || (response.ok ? null : body);
+              return {
+                taskId,
+                httpStatus: response.status,
+                requestId: response.headers.get('x-request-id') || response.headers.get('x-tt-logid') || response.headers.get('x-bce-request-id') || body?.request_id || error?.request_id || null,
+                providerStatus: body?.status || null,
+                model: body?.model || null,
+                error: error ? { code: error.code || null, message: sanitize(error.message || JSON.stringify(error)) } : null,
+              };
+            } catch (error) {
+              return { taskId, transportError: sanitize(error?.message || error) };
+            }
+          }
+
+          (async () => {
+            const [generations, usage, reservations] = await Promise.all([
+              prisma.aiGeneration.findMany({
+                where: { type: 'VIDEO', OR: [{ createdAt: { gte: since } }, { updatedAt: { gte: since } }] },
+                orderBy: { createdAt: 'asc' },
+                select: {
+                  id: true, userId: true, status: true, errorMessage: true, providerTaskId: true,
+                  externalTaskId: true, operationKey: true, tokensUsed: true, metadata: true,
+                  videoUrl: true, createdAt: true, updatedAt: true,
+                },
+              }),
+              prisma.tokenUsageLog.findMany({
+                where: { operation: 'video', createdAt: { gte: since } },
+                orderBy: { createdAt: 'asc' },
+                select: { id: true, userId: true, referenceId: true, tokensUsed: true, model: true, durationMs: true, createdAt: true },
+              }),
+              prisma.creditReservation.findMany({
+                where: { operation: 'video', createdAt: { gte: since } },
+                orderBy: { createdAt: 'asc' },
+                select: { id: true, userId: true, referenceId: true, amount: true, status: true, createdAt: true, settledAt: true, releasedAt: true },
+              }),
+            ]);
+            const provider = await Promise.all(generations.filter((item) => item.providerTaskId).map((item) => providerState(item.providerTaskId)));
+            const usageByReference = new Map();
+            for (const entry of usage) {
+              const key = String(entry.referenceId || '').split(':segment:')[0];
+              usageByReference.set(key, (usageByReference.get(key) || 0) + entry.tokensUsed);
+            }
+            const reservationByReference = new Map(reservations.map((entry) => [entry.referenceId, entry]));
+            const tasks = generations.map((item) => {
+              const metadata = item.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata) ? item.metadata : {};
+              const chargedCredits = usageByReference.get(item.id) || 0;
+              const reservation = reservationByReference.get(item.id);
+              return {
+                id: item.id,
+                user: pseudonym(item.userId),
+                endpointMode: metadata.kind === 'long-video' ? 'POST /api/ai/generate/video/long' : 'POST /api/ai/generate/video',
+                status: item.status,
+                providerTaskId: item.providerTaskId,
+                externalTaskId: item.externalTaskId,
+                operationKey: item.operationKey,
+                providerStatus: metadata.providerStatus || null,
+                model: metadata.model || null,
+                duration: metadata.duration || metadata.totalDuration || null,
+                errorMessage: sanitize(item.errorMessage),
+                hasVideoUrl: Boolean(item.videoUrl),
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt,
+                chargedCredits,
+                reservation: reservation ? { amount: reservation.amount, status: reservation.status, settledAt: reservation.settledAt, releasedAt: reservation.releasedAt } : null,
+                possibleOrphan: ['PENDING', 'FINALIZING'].includes(item.status) && !item.providerTaskId && collectedAt - item.createdAt > 2 * 60_000,
+                billingInvariantOk: item.status === 'COMPLETED' ? chargedCredits > 0 : chargedCredits === 0 || metadata.kind === 'long-video',
+              };
+            });
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              window: { minutes: windowMinutes, since: since.toISOString(), collectedAt: collectedAt.toISOString() },
+              environment: {
+                providerConfigured: Boolean(process.env.ARK_API_KEY),
+                providerHost: new URL(process.env.SEEDANCE_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3').host,
+                configuredModel: process.env.SEEDANCE_MODEL || 'doubao-seedance-2-0-mini-260615',
+                enabledModels: (process.env.SEEDANCE_ENABLED_MODELS || 'repository-defaults').split(',').map((item) => item.trim()),
+              },
+              correlation: {
+                applicationRequestIdFound: false,
+                note: 'Current application/nginx format does not persist an inbound correlation id; provider request ids are reported when supplied by the provider.',
+              },
+              summary: {
+                taskCount: tasks.length,
+                failed: tasks.filter((item) => item.status === 'FAILED').length,
+                pending: tasks.filter((item) => ['PENDING', 'FINALIZING'].includes(item.status)).length,
+                completed: tasks.filter((item) => item.status === 'COMPLETED').length,
+                possibleOrphans: tasks.filter((item) => item.possibleOrphan).length,
+                billingInvariantFailures: tasks.filter((item) => !item.billingInvariantOk).length,
+              },
+              tasks,
+              provider,
+              usage: usage.map((item) => ({ ...item, userId: pseudonym(item.userId) })),
+              reservations: reservations.map((item) => ({ ...item, userId: pseudonym(item.userId) })),
+              nginx: relevantNginxLogs(),
+              application: relevantAppLogs(),
+            }, null, 2));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+
+      - name: Upload incident evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: video-incident-evidence-${{ inputs.source_sha }}
+          path: incident-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record read-only collection
+        run: |
+          echo 'incident_collection=completed'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'window_minutes=${{ inputs.window_minutes }}'
