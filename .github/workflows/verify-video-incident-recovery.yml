@@ -127,6 +127,7 @@ jobs:
         run: node .github/e2e/production-video-incident-recovery.cjs
 
       - name: Verify production task, provider, and immutable credit ledger
+        if: ${{ always() && env.UAT_FAILED_GENERATION_ID != '' && env.UAT_COMPLETED_GENERATION_ID != '' }}
         shell: bash
         env:
           EXPECTED_RELEASE: ${{ inputs.source_sha }}
