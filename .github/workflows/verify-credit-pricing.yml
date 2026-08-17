@@ -249,6 +249,41 @@ jobs:
             return { availableCredential: true, endpointHost: base.hostname, probes: results };
           }
 
+          async function reconcilePublishedAipingTariff(usage) {
+            const base = new URL(process.env.DEEPSEEK_BASE_URL || 'https://aiping.cn/api/v1');
+            assert(base.hostname === 'aiping.cn' || base.hostname.endsWith('.aiping.cn'), `unexpected text gateway ${base.hostname}`);
+            const response = await fetch(`${base.origin}/api/v1/models`, { signal: AbortSignal.timeout(20_000) });
+            assert(response.ok, `AI Ping catalog returned HTTP ${response.status}`);
+            const catalog = await response.json();
+            const model = catalog?.data?.find(item => String(item.id).toLowerCase() === String(usage.model).toLowerCase());
+            assert(model, `AI Ping catalog does not contain ${usage.model}`);
+            const inputRange = model?.price?.input_price_range;
+            const outputRange = model?.price?.output_price_range;
+            assert(Array.isArray(inputRange) && inputRange.length === 2 && inputRange[0] === inputRange[1], 'AI Ping input tariff is not fixed');
+            assert(Array.isArray(outputRange) && outputRange.length === 2 && outputRange[0] === outputRange[1], 'AI Ping output tariff is not fixed');
+            const inputPerMillion = Number(inputRange[0]);
+            const outputPerMillion = Number(outputRange[0]);
+            const expectedCny = Number(((usage.inputTokens * inputPerMillion + usage.outputTokens * outputPerMillion) / 1_000_000).toFixed(8));
+            const ledgerCny = Number(usage.costCny);
+            assert(Number.isFinite(ledgerCny) && Math.abs(ledgerCny - expectedCny) <= 0.00000001,
+              `ledger/catalog mismatch: ledger=${ledgerCny} expected=${expectedCny}`);
+            return {
+              status: 'MATCHED_PUBLISHED_TARIFF',
+              source: `${base.origin}/api/v1/models`,
+              fetchedAt: new Date().toISOString(),
+              model: model.id,
+              currency: 'CNY',
+              inputPerMillion,
+              outputPerMillion,
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              expectedCny,
+              ledgerCny,
+              providerRequestId: usage.providerRequestId,
+              note: 'Published tariff evidence; an exported provider call-record is still required for invoice reconciliation.',
+            };
+          }
+
           (async () => {
             const health = await ok('/health', {}, 'production health');
             assert(health.status === 'ok' && health.release === expectedRelease, `unexpected active release ${health.release}`);
@@ -366,10 +401,15 @@ jobs:
               orderBy: { createdAt: 'desc' },
             });
             assert(realUsage, 'real provider call did not create a ledger row');
-            assert(realUsage.provider === 'deepseek-compatible', `gateway was mislabeled as official provider: ${realUsage.provider}`);
+            assert(realUsage.provider === 'aiping', `production gateway was not classified as AI Ping: ${realUsage.provider}`);
             assert(realUsage.providerRequestId && realUsage.inputTokens > 0 && realUsage.outputTokens > 0, 'provider request ID or authoritative token units are missing');
             assert(realUsage.usageMetrics?.providerUsageReported === true, 'provider did not return authoritative usage');
-            assert(realUsage.costStatus === 'UNPRICED', 'compatible-gateway usage was incorrectly priced with official DeepSeek rates');
+            assert(Array.isArray(realUsage.usageMetrics?.upstreamProviders) && realUsage.usageMetrics.upstreamProviders.length > 0,
+              'AI Ping routed upstream provider was not captured');
+            assert(realUsage.costStatus === 'PRICED' && realUsage.pricingRuleKey === 'aiping-deepseek-v4-flash',
+              `AI Ping usage was not priced by its official gateway tariff: ${realUsage.costStatus}/${realUsage.pricingRuleKey}`);
+            assert(realUsage.costCurrency === 'CNY' && realUsage.costCny !== null, 'AI Ping ledger is missing the original CNY cost');
+            const tariffReconciliation = await reconcilePublishedAipingTariff(realUsage);
 
             const pricingService = new ModelPricingVersionService(prisma);
             const billing = new TokenBillingService(prisma, pricingService);
@@ -495,6 +535,7 @@ jobs:
                     immutableMutationRejected: true,
                   },
                   realProviderLedger: publicLog(realUsage),
+                  providerTariffReconciliation: tariffReconciliation,
                   providerBillingAccess: billingProbe,
                   adminMetrics: {
                     people: stats.claims.people,
