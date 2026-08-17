@@ -98,6 +98,7 @@ function safeVideoReference(value) {
     assert(failureBody.requestId, 'Provider rejection did not return the inbound request ID');
     assert(failureBody.providerClientRequestId, 'Provider rejection did not return the outbound request ID');
     failedGenerationId = failureBody.generationId;
+    fs.appendFileSync(process.env.GITHUB_ENV, `UAT_FAILED_GENERATION_ID=${failedGenerationId}\n`);
     await page.getByText('视频任务未被上游受理', { exact: true }).waitFor({ timeout: 20_000 });
     const failedStatus = await status(context, failedGenerationId);
     assert(failedStatus.status === 'FAILED', `Rejected generation is ${failedStatus.status}, expected FAILED`);
@@ -129,6 +130,7 @@ function safeVideoReference(value) {
     assert(successBody.id, 'Short video submission did not return a generation ID');
     assert(successBody.creditCost === 400, `Expected 400 credits, got ${successBody.creditCost}`);
     completedGenerationId = successBody.id;
+    fs.appendFileSync(process.env.GITHUB_ENV, `UAT_COMPLETED_GENERATION_ID=${completedGenerationId}\n`);
     const submissionRequestId = successResponse.headers()['x-request-id'];
     assert(submissionRequestId, 'Successful submission response lacks X-Request-Id');
 
@@ -159,7 +161,8 @@ function safeVideoReference(value) {
     assert(current.videoUrl, 'Completed short video has no video URL');
     assert(current.stage?.code === 'succeeded', `Completed task stage is ${current.stage?.code}`);
     assert(current.progress?.completedUnits === current.progress?.totalUnits, 'Completed task progress is not terminal');
-    const videoResponse = await context.request.get(current.videoUrl, { timeout: 60_000 });
+    const resolvedVideoUrl = new URL(current.videoUrl, baseUrl).toString();
+    const videoResponse = await context.request.get(resolvedVideoUrl, { timeout: 60_000 });
     assert(videoResponse.ok(), `Completed video URL returned HTTP ${videoResponse.status()}`);
     await page.locator('video').waitFor({ timeout: 45_000 });
     await page.screenshot({ path: path.join(evidenceDir, '03-completed-short-video.png'), fullPage: true });
@@ -199,7 +202,6 @@ function safeVideoReference(value) {
       },
     };
     fs.writeFileSync(path.join(evidenceDir, 'browser-and-api-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
-    fs.appendFileSync(process.env.GITHUB_ENV, `UAT_FAILED_GENERATION_ID=${failedGenerationId}\nUAT_COMPLETED_GENERATION_ID=${completedGenerationId}\n`);
     console.log(JSON.stringify({
       release: expectedRelease,
       failedGenerationId,
