@@ -214,7 +214,7 @@ jobs:
               return output;
             }
             const probes = [
-              { name: 'key-cost', url: `${base.origin}/api/v1/user/apikey/usage/cost?days=1`, method: 'GET' },
+              { name: 'key-cost', url: `${base.origin}/api/v1/user/apikey/usage/cost?days=7`, method: 'GET' },
               { name: 'call-log', url: `${base.origin}/api/v1/maashub/api_call_log/list`, method: 'POST', body: { page: 1, page_size: 1 } },
             ];
             const results = [];
