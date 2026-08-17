@@ -121,7 +121,7 @@ jobs:
                 isActivated: true,
                 aiPersona: 'PRODUCT_OWNER',
                 aiOnboardingDone: true,
-                tokenPacks: { create: { name: 'Director UAT Credits', totalTokens: 10000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
+                tokenPacks: { create: { name: 'Director UAT Credits', totalTokens: 100000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
               },
             });
             const normal = await prisma.user.create({
