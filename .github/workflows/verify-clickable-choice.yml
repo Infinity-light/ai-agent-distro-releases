@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Infinity-light/ai-agent-distro
-          ref: 276a5074753da1879751b20556918db6b4adb44c
+          ref: 2409056cf1bedd3fab2ffedc33786b3558be9de9
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           path: source
 
