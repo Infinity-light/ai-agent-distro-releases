@@ -188,8 +188,33 @@ jobs:
             const base = new URL(process.env.DEEPSEEK_BASE_URL || 'https://aiping.cn/api/v1');
             const key = process.env.DEEPSEEK_API_KEY || '';
             if (!key) return { availableCredential: false };
+            function numericEvidence(value, path = 'data', output = [], depth = 0) {
+              if (output.length >= 100 || depth > 8 || value === undefined) return output;
+              if (value === null || typeof value === 'number' || typeof value === 'boolean') {
+                output.push({ path, value });
+                return output;
+              }
+              if (typeof value === 'string') {
+                const trimmed = value.trim();
+                if (/^-?\d+(?:\.\d+)?$/.test(trimmed) || /^\d{4}-\d{2}-\d{2}(?:[T ]|$)/.test(trimmed)) {
+                  output.push({ path, value: trimmed.slice(0, 80) });
+                }
+                return output;
+              }
+              if (Array.isArray(value)) {
+                value.slice(0, 20).forEach((item, index) => numericEvidence(item, `${path}[${index}]`, output, depth + 1));
+                return output;
+              }
+              if (typeof value === 'object') {
+                for (const [name, item] of Object.entries(value)) {
+                  if (/(?:api.?key|secret|token|password|phone|email|user.?name)/i.test(name)) continue;
+                  numericEvidence(item, `${path}.${name}`, output, depth + 1);
+                }
+              }
+              return output;
+            }
             const probes = [
-              { name: 'key-cost', url: `${base.origin}/api/v1/user/apikey/usage/cost`, method: 'GET' },
+              { name: 'key-cost', url: `${base.origin}/api/v1/user/apikey/usage/cost?days=1`, method: 'GET' },
               { name: 'call-log', url: `${base.origin}/api/v1/maashub/api_call_log/list`, method: 'POST', body: { page: 1, page_size: 1 } },
             ];
             const results = [];
@@ -204,7 +229,19 @@ jobs:
                 const text = await response.text();
                 let parsed;
                 try { parsed = JSON.parse(text); } catch { parsed = {}; }
-                results.push({ name: probe.name, status: response.status, code: parsed?.code ?? null, message: String(parsed?.msg || parsed?.message || '').slice(0, 160) });
+                results.push({
+                  name: probe.name,
+                  status: response.status,
+                  code: parsed?.code ?? null,
+                  message: String(parsed?.msg || parsed?.message || '').slice(0, 160),
+                  ...(probe.name === 'key-cost' && response.ok ? {
+                    topLevelKeys: Object.keys(parsed || {}).slice(0, 20),
+                    dataKeys: parsed?.data && !Array.isArray(parsed.data) && typeof parsed.data === 'object'
+                      ? Object.keys(parsed.data).slice(0, 30)
+                      : [],
+                    numericEvidence: numericEvidence(parsed?.data),
+                  } : {}),
+                });
               } catch (error) {
                 results.push({ name: probe.name, status: null, message: String(error?.message || error).slice(0, 160) });
               }
