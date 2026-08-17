@@ -157,7 +157,7 @@ function safeVideoReference(value) {
     }
     assert(current.status === 'COMPLETED', `Short video ended as ${current.status || 'timeout'}: ${current.errorMessage || ''}`);
     assert(current.videoUrl, 'Completed short video has no video URL');
-    assert(current.stage?.code === 'completed', `Completed task stage is ${current.stage?.code}`);
+    assert(current.stage?.code === 'succeeded', `Completed task stage is ${current.stage?.code}`);
     assert(current.progress?.completedUnits === current.progress?.totalUnits, 'Completed task progress is not terminal');
     const videoResponse = await context.request.get(current.videoUrl, { timeout: 60_000 });
     assert(videoResponse.ok(), `Completed video URL returned HTTP ${videoResponse.status()}`);
