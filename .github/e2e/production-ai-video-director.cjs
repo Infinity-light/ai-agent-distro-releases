@@ -578,6 +578,19 @@ function appendGithubEnv(name, value) {
     const successData = unwrap(
       await json(successResponse, "successful confirmation action"),
     );
+    fs.writeFileSync(
+      path.join(evidenceDir, "success-action-response.json"),
+      `${JSON.stringify(
+        {
+          httpStatus: successResponse.status(),
+          requestId: successResponse.headers()["x-request-id"] || null,
+          invokedAction: successData.invokedAction || null,
+          toolResults: successData.toolResults || [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
     const successTool = successData.toolResults?.find(
       (item) => item.toolName === "generate_video",
     );
