@@ -79,18 +79,35 @@ async function pageMetrics(page) {
       sidebar: rect(document.querySelector('[data-testid="app-sidebar"]')),
       bottomNav: rect(document.querySelector('[data-testid="mobile-bottom-nav"]')),
       brandLogoCount: document.querySelectorAll('[data-testid="brand-logo"]').length,
-      assistantAvatarCount: document.querySelectorAll('.assistant-avatar').length,
+      brandLogoSource: document.querySelector('[data-testid="app-header"] img[alt="智多多品牌 Logo"]')?.getAttribute('src') || null,
+      brandLogoWidth: Math.round(document.querySelector('[data-testid="app-header"] img[alt="智多多品牌 Logo"]')?.getBoundingClientRect().width || 0),
+      assistantMascotCount: document.querySelectorAll('[data-testid="assistant-mascot"]').length,
+      assistantMascotSource: document.querySelector('[data-testid="assistant-mascot"] img')?.getAttribute('src') || null,
+      assistantMascotSize: rect(document.querySelector('[data-testid="assistant-mascot"]')),
+      messageMascotCount: document.querySelectorAll('.msg-ai [data-testid="assistant-mascot"]').length,
       welcomeMessageCount: document.querySelectorAll('[aria-label="智多多 AI 助手欢迎消息"]').length,
       horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
     };
   });
 }
 
-async function assertBrandImage(page, label) {
-  const logo = page.locator('img[alt="智多多官方标志"]');
-  assert(await logo.count() === 1, `${label}: expected one official logo, got ${await logo.count()}`);
+async function assertSeparatedBrandIdentities(page, label) {
+  const logo = page.locator('[data-testid="app-header"] img[alt="智多多品牌 Logo"]');
+  const mascot = page.locator('[data-testid="chat-assistant-identity"] [data-testid="assistant-mascot"]');
+  assert(await logo.count() === 1, `${label}: expected one corporate brand logo in the header, got ${await logo.count()}`);
   const loaded = await logo.evaluate(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
-  assert(loaded, `${label}: official logo did not load`);
+  assert(loaded, `${label}: corporate brand logo did not load`);
+  const logoSource = await logo.getAttribute('src');
+  assert(logoSource?.includes('/assets/brand/zhiduoduo-brand-lockup-light-'), `${label}: unexpected brand logo source ${logoSource}`);
+
+  assert(await mascot.count() === 1, `${label}: expected one Chat assistant mascot, got ${await mascot.count()}`);
+  const mascotImage = mascot.locator('img');
+  const mascotLoaded = await mascotImage.evaluate(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
+  assert(mascotLoaded, `${label}: Chat assistant mascot did not load`);
+  const mascotSource = await mascotImage.getAttribute('src');
+  assert(mascotSource === '/assets/zhiduoduo-assistant-v1.png', `${label}: unexpected mascot source ${mascotSource}`);
+  assert(logoSource !== mascotSource, `${label}: corporate brand and Chat mascot use the same asset`);
+  assert(await page.locator('[data-testid="app-header"] img[src*="zhiduoduo-assistant-v1.png"]').count() === 0, `${label}: mascot leaked into global header`);
 }
 
 async function verifyDesktop(browser) {
@@ -100,16 +117,27 @@ async function verifyDesktop(browser) {
   try {
     await verifyRelease(context, label);
     await loadChat(page, label);
-    await assertBrandImage(page, label);
+    await assertSeparatedBrandIdentities(page, label);
     const metrics = await pageMetrics(page);
     assert(JSON.stringify(metrics.topbar) === JSON.stringify({ x: 0, y: 0, width: 1440, height: 64, top: 0, right: 1440, bottom: 64, left: 0 }), `${label}: invalid topbar ${JSON.stringify(metrics.topbar)}`);
     assert(JSON.stringify(metrics.sidebar) === JSON.stringify({ x: 0, y: 64, width: 220, height: 836, top: 64, right: 220, bottom: 900, left: 0 }), `${label}: invalid sidebar ${JSON.stringify(metrics.sidebar)}`);
     assert(metrics.brandLogoCount === 1, `${label}: expected one brand lockup, got ${metrics.brandLogoCount}`);
-    assert(metrics.assistantAvatarCount === 0, `${label}: repeated assistant avatars remain (${metrics.assistantAvatarCount})`);
+    assert(metrics.brandLogoWidth === 132, `${label}: expected 132px header logo, got ${metrics.brandLogoWidth}`);
+    assert(metrics.assistantMascotCount === 1, `${label}: expected one assistant mascot, got ${metrics.assistantMascotCount}`);
+    assert(metrics.assistantMascotSize?.width === 42 && metrics.assistantMascotSize?.height === 42, `${label}: invalid assistant mascot size ${JSON.stringify(metrics.assistantMascotSize)}`);
+    assert(metrics.messageMascotCount === 0, `${label}: repeated assistant mascots remain in messages (${metrics.messageMascotCount})`);
     assert(metrics.welcomeMessageCount === 1, `${label}: welcome message role marker missing`);
     assert(metrics.horizontalOverflow === 0, `${label}: horizontal overflow ${metrics.horizontalOverflow}px`);
     await page.screenshot({ path: path.join(evidenceDir, `${label}.png`), fullPage: true });
-    return metrics;
+
+    await page.locator('.page-enter').evaluate(element => { element.style.minHeight = '1800px'; });
+    await page.evaluate(() => window.scrollTo(0, 800));
+    const scrollAnchors = await page.evaluate(() => ({
+      topbarY: Math.round(document.querySelector('[data-testid="app-header"]')?.getBoundingClientRect().y ?? -1),
+      sidebarY: Math.round(document.querySelector('[data-testid="app-sidebar"]')?.getBoundingClientRect().y ?? -1),
+    }));
+    assert(scrollAnchors.topbarY === 0 && scrollAnchors.sidebarY === 64, `${label}: fixed shell shifted on scroll ${JSON.stringify(scrollAnchors)}`);
+    return { ...metrics, scrollAnchors };
   } finally {
     await context.close();
   }
@@ -122,13 +150,16 @@ async function verifyMobile(browser) {
   try {
     await verifyRelease(context, label);
     await loadChat(page, label);
-    await assertBrandImage(page, label);
+    await assertSeparatedBrandIdentities(page, label);
     const metrics = await pageMetrics(page);
     assert(JSON.stringify(metrics.topbar) === JSON.stringify({ x: 0, y: 0, width: 390, height: 56, top: 0, right: 390, bottom: 56, left: 0 }), `${label}: invalid topbar ${JSON.stringify(metrics.topbar)}`);
     assert(metrics.sidebar === null, `${label}: fixed desktop sidebar is still present`);
     assert(metrics.bottomNav && metrics.bottomNav.x === 0 && metrics.bottomNav.right === 390 && metrics.bottomNav.bottom === 844, `${label}: invalid bottom navigation ${JSON.stringify(metrics.bottomNav)}`);
     assert(metrics.brandLogoCount === 1, `${label}: expected one brand lockup, got ${metrics.brandLogoCount}`);
-    assert(metrics.assistantAvatarCount === 0, `${label}: repeated assistant avatars remain (${metrics.assistantAvatarCount})`);
+    assert(metrics.brandLogoWidth === 108, `${label}: expected 108px header logo, got ${metrics.brandLogoWidth}`);
+    assert(metrics.assistantMascotCount === 1, `${label}: expected one assistant mascot, got ${metrics.assistantMascotCount}`);
+    assert(metrics.assistantMascotSize?.width === 34 && metrics.assistantMascotSize?.height === 34, `${label}: invalid assistant mascot size ${JSON.stringify(metrics.assistantMascotSize)}`);
+    assert(metrics.messageMascotCount === 0, `${label}: repeated assistant mascots remain in messages (${metrics.messageMascotCount})`);
     assert(metrics.welcomeMessageCount === 1, `${label}: welcome message role marker missing`);
     assert(metrics.horizontalOverflow === 0, `${label}: horizontal overflow ${metrics.horizontalOverflow}px`);
     await page.screenshot({ path: path.join(evidenceDir, `${label}.png`), fullPage: true });
@@ -136,9 +167,12 @@ async function verifyMobile(browser) {
     await page.getByRole('button', { name: '打开导航菜单' }).click();
     const drawer = page.locator('.ant-drawer-content-wrapper');
     await drawer.waitFor({ state: 'visible' });
-    await page.waitForFunction(() => Math.round(document.querySelector('.ant-drawer-content-wrapper')?.getBoundingClientRect().x || -1) === 0);
+    await page.waitForFunction(() => Math.round(document.querySelector('.ant-drawer-content-wrapper')?.getBoundingClientRect().x ?? -1) === 0);
     const drawerRect = await drawer.evaluate(roundedRect);
     assert(drawerRect.x === 0 && drawerRect.y === 0 && drawerRect.width === 260 && drawerRect.height === 844, `${label}: invalid drawer ${JSON.stringify(drawerRect)}`);
+    const drawerLogo = drawer.locator('img[alt="智多多品牌 Logo"]');
+    assert(await drawerLogo.count() === 1, `${label}: drawer brand logo missing`);
+    assert((await drawerLogo.getAttribute('src'))?.includes('/assets/brand/zhiduoduo-brand-lockup-light-'), `${label}: drawer uses unexpected brand asset`);
     await page.screenshot({ path: path.join(evidenceDir, `${label}-drawer.png`), fullPage: true });
     return { ...metrics, drawer: drawerRect };
   } finally {
