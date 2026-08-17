@@ -406,8 +406,26 @@ jobs:
             assert(realUsage.usageMetrics?.providerUsageReported === true, 'provider did not return authoritative usage');
             assert(Array.isArray(realUsage.usageMetrics?.upstreamProviders) && realUsage.usageMetrics.upstreamProviders.length > 0,
               'AI Ping routed upstream provider was not captured');
+            const usagePricingVersion = realUsage.pricingVersionId
+              ? await prisma.modelPricingVersion.findUnique({ where: { id: realUsage.pricingVersionId } })
+              : null;
+            const pricingSnapshotDiagnostic = {
+              usage: publicLog(realUsage),
+              version: usagePricingVersion ? {
+                id: usagePricingVersion.id,
+                version: usagePricingVersion.version,
+                name: usagePricingVersion.name,
+                effectiveAt: usagePricingVersion.effectiveAt,
+                matchingRules: Array.isArray(usagePricingVersion.rules)
+                  ? usagePricingVersion.rules.filter(rule =>
+                    String(rule.provider).toLowerCase() === String(realUsage.provider).toLowerCase()
+                    || (Array.isArray(rule.models) && rule.models.some(model => String(model).toLowerCase() === String(realUsage.model).toLowerCase())),
+                  )
+                  : [],
+              } : null,
+            };
             assert(realUsage.costStatus === 'PRICED' && realUsage.pricingRuleKey === 'aiping-deepseek-v4-flash',
-              `AI Ping usage was not priced by its official gateway tariff: ${realUsage.costStatus}/${realUsage.pricingRuleKey}`);
+              `AI Ping usage was not priced by its official gateway tariff: ${JSON.stringify(pricingSnapshotDiagnostic)}`);
             assert(realUsage.costCurrency === 'CNY' && realUsage.costCny !== null, 'AI Ping ledger is missing the original CNY cost');
             const tariffReconciliation = await reconcilePublishedAipingTariff(realUsage);
 
@@ -535,6 +553,7 @@ jobs:
                     immutableMutationRejected: true,
                   },
                   realProviderLedger: publicLog(realUsage),
+                  realProviderPricingSnapshot: pricingSnapshotDiagnostic.version,
                   providerTariffReconciliation: tariffReconciliation,
                   providerBillingAccess: billingProbe,
                   adminMetrics: {
