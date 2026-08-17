@@ -103,7 +103,7 @@ jobs:
 
           function tokenFor(user) {
             return jwt.sign(
-              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion },
               process.env.JWT_SECRET,
               { expiresIn: '30m' },
             );
