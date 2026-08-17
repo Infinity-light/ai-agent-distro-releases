@@ -1,0 +1,583 @@
+name: Verify Zhiduoduo Credit Pricing Production
+run-name: "verify credit-pricing ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zhiduoduo-credit-pricing-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Validate bound release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install production browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.0
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+
+      - name: Run isolated API, ledger, permission, and pricing-version UAT
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PHONE="credit-user-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PHONE=$E2E_UAT_PHONE" >> "$GITHUB_ENV"
+          mkdir -p uat-artifacts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          uat_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PHONE='$E2E_UAT_PHONE' UAT_RUN_ID='$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const { TokenBillingService } = require('./dist/apps/api/apps/api/src/ai/token-billing.service.js');
+          const { ModelPricingVersionService } = require('./dist/apps/api/apps/api/src/system-config/model-pricing-version.service.js');
+
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+          const expectedRelease = process.env.EXPECTED_RELEASE;
+          const marker = `production-credit-pricing-uat:${process.env.UAT_RUN_ID}`;
+          const refs = {
+            before: `${marker}:before`,
+            priced: `${marker}:priced`,
+            rollback: `${marker}:rollback`,
+          };
+
+          function assert(condition, message) {
+            if (!condition) throw new Error(message);
+          }
+
+          function tokenFor(user) {
+            return jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '30m' },
+            );
+          }
+
+          function bearer(token) {
+            return { authorization: `Bearer ${token}` };
+          }
+
+          async function request(path, { token, method = 'GET', body, headers = {} } = {}) {
+            const response = await fetch(`${apiBase}${path}`, {
+              method,
+              headers: {
+                ...(token ? bearer(token) : {}),
+                ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+                ...headers,
+              },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+              signal: AbortSignal.timeout(180_000),
+            });
+            const text = await response.text();
+            let payload;
+            try { payload = text ? JSON.parse(text) : null; } catch { payload = { raw: text }; }
+            return { response, payload, data: payload?.data ?? payload };
+          }
+
+          async function ok(path, options, label) {
+            const result = await request(path, options);
+            if (!result.response.ok || (result.payload?.code !== undefined && result.payload.code !== 0)) {
+              throw new Error(`${label} failed with HTTP ${result.response.status}: ${JSON.stringify(result.payload).slice(0, 800)}`);
+            }
+            return result.data;
+          }
+
+          async function cleanupUser(userId) {
+            if (!userId) return;
+            const grants = await prisma.creditGrant.findMany({ where: { userId }, select: { id: true } });
+            const grantIds = grants.map(item => item.id);
+            const logs = await prisma.tokenUsageLog.findMany({ where: { userId }, select: { id: true } });
+            const logIds = logs.map(item => item.id);
+            if (logIds.length) await prisma.providerBillSample.deleteMany({ where: { usageLogId: { in: logIds } } });
+            if (grantIds.length) await prisma.creditGrantEvent.deleteMany({ where: { grantId: { in: grantIds } } });
+            await prisma.tokenUsageLog.deleteMany({ where: { userId } });
+            await prisma.creditReservation.deleteMany({ where: { userId } });
+            await prisma.creditGrant.deleteMany({ where: { userId } });
+            await prisma.dailyTokenUsage.deleteMany({ where: { userId } });
+            await prisma.aiGeneration.updateMany({ where: { userId }, data: { relatedId: null } });
+            await prisma.aiGeneration.deleteMany({ where: { userId } });
+            await prisma.aiConversation.deleteMany({ where: { userId } });
+            await prisma.businessProfile.deleteMany({ where: { userId } });
+            await prisma.feedback.deleteMany({ where: { userId } });
+            await prisma.activationCode.deleteMany({ where: { userId } });
+            await prisma.transaction.deleteMany({ where: { userId } });
+            await prisma.tokenPack.deleteMany({ where: { userId } });
+            await prisma.user.deleteMany({ where: { id: userId } });
+          }
+
+          function publicLog(log) {
+            return {
+              id: log.id,
+              referenceId: log.referenceId,
+              businessType: log.businessType,
+              provider: log.provider,
+              providerEndpoint: log.providerEndpoint,
+              providerRequestId: log.providerRequestId,
+              model: log.model,
+              inputTokens: log.inputTokens,
+              outputTokens: log.outputTokens,
+              cachedInputTokens: log.cachedInputTokens,
+              pricingVersionId: log.pricingVersionId,
+              pricingRuleKey: log.pricingRuleKey,
+              costStatus: log.costStatus,
+              costOriginal: log.costOriginal === null ? null : Number(log.costOriginal),
+              costCurrency: log.costCurrency,
+              costUsd: log.costUsd === null ? null : Number(log.costUsd),
+              costCny: log.costCny === null ? null : Number(log.costCny),
+              usageMetrics: log.usageMetrics,
+            };
+          }
+
+          async function providerBillingProbe() {
+            const base = new URL(process.env.DEEPSEEK_BASE_URL || 'https://aiping.cn/api/v1');
+            const key = process.env.DEEPSEEK_API_KEY || '';
+            if (!key) return { availableCredential: false };
+            const probes = [
+              { name: 'key-cost', url: `${base.origin}/api/v1/user/apikey/usage/cost`, method: 'GET' },
+              { name: 'call-log', url: `${base.origin}/api/v1/maashub/api_call_log/list`, method: 'POST', body: { page: 1, page_size: 1 } },
+            ];
+            const results = [];
+            for (const probe of probes) {
+              try {
+                const response = await fetch(probe.url, {
+                  method: probe.method,
+                  headers: { authorization: `Bearer ${key}`, ...(probe.body ? { 'content-type': 'application/json' } : {}) },
+                  ...(probe.body ? { body: JSON.stringify(probe.body) } : {}),
+                  signal: AbortSignal.timeout(20_000),
+                });
+                const text = await response.text();
+                let parsed;
+                try { parsed = JSON.parse(text); } catch { parsed = {}; }
+                results.push({ name: probe.name, status: response.status, code: parsed?.code ?? null, message: String(parsed?.msg || parsed?.message || '').slice(0, 160) });
+              } catch (error) {
+                results.push({ name: probe.name, status: null, message: String(error?.message || error).slice(0, 160) });
+              }
+            }
+            return { availableCredential: true, endpointHost: base.hostname, probes: results };
+          }
+
+          (async () => {
+            const health = await ok('/health', {}, 'production health');
+            assert(health.status === 'ok' && health.release === expectedRelease, `unexpected active release ${health.release}`);
+
+            const stale = await prisma.user.findMany({
+              where: { phone: { startsWith: 'credit-user-uat-' } },
+              select: { id: true },
+            });
+            for (const item of stale) await cleanupUser(item.id);
+
+            const admin = await prisma.user.findFirst({
+              where: { role: 'PLATFORM_ADMIN', isActive: true },
+              orderBy: { createdAt: 'asc' },
+            });
+            assert(admin, 'production has no active platform administrator for permission UAT');
+            const adminToken = tokenFor(admin);
+
+            const now = new Date();
+            const user = await prisma.user.create({
+              data: {
+                phone: process.env.E2E_UAT_PHONE,
+                email: `${process.env.E2E_UAT_PHONE}@test.local`,
+                passwordHash: 'disabled-production-credit-pricing-uat',
+                name: '生产积分 UAT',
+                role: 'TERMINAL_USER',
+                isActivated: true,
+              },
+            });
+            const userToken = tokenFor(user);
+            await prisma.activationCode.create({
+              data: {
+                code: `CREDIT-UAT-${process.env.UAT_RUN_ID}`,
+                type: 'TERMINAL',
+                userId: user.id,
+                status: 'USED',
+                activatedAt: now,
+                expiresAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
+              },
+            });
+
+            const initial = await ok('/token-packs/daily-claim', { token: userToken }, 'daily claim status');
+            assert(initial.timezone === 'Asia/Shanghai', `unexpected timezone ${initial.timezone}`);
+            assert(initial.amount === 600, `production daily claim is ${initial.amount}, expected verified rule 600`);
+            assert(initial.eligible && initial.canClaim && !initial.claimed, `new 365-day user is not claimable: ${JSON.stringify(initial)}`);
+
+            const claimKey = `production-claim-${process.env.UAT_RUN_ID}`;
+            const claimed = await ok('/token-packs/daily-claim', {
+              token: userToken,
+              method: 'POST',
+              headers: { 'x-idempotency-key': claimKey },
+              body: {},
+            }, 'first daily claim');
+            assert(claimed.claimed && !claimed.idempotentReplay && claimed.grant.amount === 600, 'first claim did not credit exactly 600');
+
+            const replay = await ok('/token-packs/daily-claim', {
+              token: userToken,
+              method: 'POST',
+              headers: { 'x-idempotency-key': claimKey },
+              body: {},
+            }, 'same-key daily claim replay');
+            assert(replay.idempotentReplay && replay.grant.id === claimed.grant.id, 'same idempotency key did not replay the original grant');
+
+            const duplicate = await request('/token-packs/daily-claim', {
+              token: userToken,
+              method: 'POST',
+              headers: { 'x-idempotency-key': `production-duplicate-${process.env.UAT_RUN_ID}` },
+              body: {},
+            });
+            assert(duplicate.response.status === 409, `different-key duplicate returned ${duplicate.response.status}, expected 409`);
+
+            const deniedStats = await request('/admin/credit-grants/stats', { token: userToken });
+            const deniedPricing = await request('/system-config/pricing-versions', { token: userToken });
+            const deniedMakeup = await request('/admin/credit-grants/makeup', {
+              token: userToken,
+              method: 'POST',
+              body: { userId: user.id, amount: 7, reason: '普通用户越权测试', idempotencyKey: `denied-${process.env.UAT_RUN_ID}` },
+            });
+            assert(deniedStats.response.status === 403 && deniedPricing.response.status === 403 && deniedMakeup.response.status === 403,
+              `ordinary-user access was not denied: ${deniedStats.response.status}/${deniedPricing.response.status}/${deniedMakeup.response.status}`);
+
+            const makeupInput = {
+              userId: user.id,
+              amount: 7,
+              reason: '生产 UAT 验证补发幂等与冻结撤销规则',
+              idempotencyKey: `production-makeup-${process.env.UAT_RUN_ID}`,
+            };
+            const makeup = await ok('/admin/credit-grants/makeup', { token: adminToken, method: 'POST', body: makeupInput }, 'admin makeup');
+            const makeupReplay = await ok('/admin/credit-grants/makeup', { token: adminToken, method: 'POST', body: makeupInput }, 'admin makeup replay');
+            assert(!makeup.idempotentReplay && makeupReplay.idempotentReplay && makeup.grant.id === makeupReplay.grant.id, 'makeup idempotency failed');
+            const state = async (action, reason) => ok(`/admin/credit-grants/${makeup.grant.id}/state`, {
+              token: adminToken,
+              method: 'POST',
+              body: { action, reason },
+            }, `grant ${action}`);
+            assert((await state('freeze', '生产 UAT 冻结验证')).status === 'FROZEN', 'freeze did not persist');
+            assert((await state('unfreeze', '生产 UAT 解冻验证')).status === 'ACTIVE', 'unfreeze did not persist');
+            assert((await state('revoke', '生产 UAT 撤销验证')).status === 'REVOKED', 'revoke did not persist');
+
+            const chat = await request('/ai/chat/send/stream', {
+              token: userToken,
+              method: 'POST',
+              body: { message: '生产成本账本 UAT：请只回复 OK，不调用任何工具。' },
+            });
+            assert(chat.response.ok, `real provider chat returned HTTP ${chat.response.status}`);
+            const streamText = chat.payload?.raw || '';
+            const events = streamText.split(/\r?\n/)
+              .filter(line => line.startsWith('data: '))
+              .map(line => JSON.parse(line.slice(6)));
+            const streamError = events.find(event => event.type === 'error');
+            if (streamError) throw new Error(`real provider chat failed: ${streamError.message}`);
+            const done = events.find(event => event.type === 'done');
+            assert(done?.payload?.conversationId, 'real provider chat did not complete');
+            const realUsage = await prisma.tokenUsageLog.findFirst({
+              where: { userId: user.id, businessType: 'TEXT', providerRequestId: { not: null } },
+              orderBy: { createdAt: 'desc' },
+            });
+            assert(realUsage, 'real provider call did not create a ledger row');
+            assert(realUsage.provider === 'deepseek-compatible', `gateway was mislabeled as official provider: ${realUsage.provider}`);
+            assert(realUsage.providerRequestId && realUsage.inputTokens > 0 && realUsage.outputTokens > 0, 'provider request ID or authoritative token units are missing');
+            assert(realUsage.usageMetrics?.providerUsageReported === true, 'provider did not return authoritative usage');
+            assert(realUsage.costStatus === 'UNPRICED', 'compatible-gateway usage was incorrectly priced with official DeepSeek rates');
+
+            const pricingService = new ModelPricingVersionService(prisma);
+            const billing = new TokenBillingService(prisma, pricingService);
+            const listed = await ok('/system-config/pricing-versions', { token: adminToken }, 'pricing versions');
+            const original = listed.versions.find(item => item.id === listed.effectiveVersionId);
+            assert(original, 'no effective production pricing version');
+            const uatProvider = 'zdd-production-uat';
+            const uatModel = `zdd-production-uat-image-${process.env.UAT_RUN_ID}`;
+            await billing.logUsage(user.id, 'personal_image', refs.before, {
+              businessType: 'IMAGE', provider: uatProvider, model: uatModel, imageCount: 1,
+              providerRequestId: `${process.env.UAT_RUN_ID}-before`, providerUsageReported: true,
+            });
+            const before = await prisma.tokenUsageLog.findFirst({ where: { userId: user.id, referenceId: refs.before } });
+            assert(before?.pricingVersionId === original.id && before.costStatus === 'UNPRICED', 'pre-change usage did not retain the original version');
+
+            const businessDate = new Intl.DateTimeFormat('en-CA', {
+              timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+            }).format(new Date());
+            const testRule = {
+              key: `zdd-production-uat-${process.env.UAT_RUN_ID}`.toLowerCase(),
+              businessType: 'IMAGE',
+              provider: uatProvider,
+              models: [uatModel],
+              currency: 'CNY',
+              kind: 'PER_IMAGE',
+              rates: { perImage: 0.12345678 },
+              sourceUrl: 'https://zhiduoduoai.com/api/health',
+              sourceAsOf: businessDate,
+            };
+            let testVersion;
+            let rollbackVersion;
+            try {
+              testVersion = await ok('/system-config/pricing-versions', {
+                token: adminToken,
+                method: 'POST',
+                body: {
+                  name: `生产 UAT 临时安全定价 ${process.env.UAT_RUN_ID}`,
+                  effectiveAt: new Date().toISOString(),
+                  rules: [...original.rules, testRule],
+                  usdToCny: Number(original.usdToCny),
+                  fxRateAsOf: original.fxRateAsOf,
+                  fxSourceUrl: original.fxSourceUrl,
+                  notes: marker,
+                },
+              }, 'publish UAT pricing version');
+
+              await billing.logUsage(user.id, 'personal_image', refs.priced, {
+                businessType: 'IMAGE', provider: uatProvider, model: uatModel, imageCount: 1,
+                providerRequestId: `${process.env.UAT_RUN_ID}-priced`, providerUsageReported: true,
+              });
+              const priced = await prisma.tokenUsageLog.findFirst({ where: { userId: user.id, referenceId: refs.priced } });
+              assert(priced?.pricingVersionId === testVersion.id && priced.costStatus === 'PRICED', 'new usage did not select the new pricing version');
+              assert(Number(priced.costOriginal) === 0.12345678 && priced.costCurrency === 'CNY', `new usage has wrong cost ${priced.costOriginal} ${priced.costCurrency}`);
+
+              const historical = await prisma.tokenUsageLog.findUnique({ where: { id: before.id } });
+              assert(historical.pricingVersionId === original.id && historical.costStatus === 'UNPRICED' && historical.costOriginal === null,
+                'publishing a version rewrote historical usage');
+
+              let immutableRejected = false;
+              try {
+                await prisma.modelPricingVersion.update({ where: { id: testVersion.id }, data: { name: 'forbidden mutation' } });
+              } catch (error) {
+                immutableRejected = /immutable/i.test(String(error?.message || error)) || error?.code === 'P2010';
+              }
+              assert(immutableRejected, 'database allowed an in-place pricing-version mutation');
+
+              rollbackVersion = await ok(`/system-config/pricing-versions/${original.id}/rollback`, {
+                token: adminToken,
+                method: 'POST',
+                body: { effectiveAt: new Date().toISOString(), reason: `${marker}: restore original rules` },
+              }, 'rollback pricing version');
+
+              await billing.logUsage(user.id, 'personal_image', refs.rollback, {
+                businessType: 'IMAGE', provider: uatProvider, model: uatModel, imageCount: 1,
+                providerRequestId: `${process.env.UAT_RUN_ID}-rollback`, providerUsageReported: true,
+              });
+              const rolled = await prisma.tokenUsageLog.findFirst({ where: { userId: user.id, referenceId: refs.rollback } });
+              assert(rolled?.pricingVersionId === rollbackVersion.id && rolled.costStatus === 'UNPRICED', 'rollback did not affect only subsequent usage');
+
+              const finalListed = await ok('/system-config/pricing-versions', { token: adminToken }, 'final pricing versions');
+              assert(finalListed.effectiveVersionId === rollbackVersion.id, 'rollback version is not the final active version');
+
+              const stats = await ok('/admin/credit-grants/stats', { token: adminToken }, 'admin credit stats');
+              assert(stats.timezone === 'Asia/Shanghai' && stats.claims.people >= 1 && stats.claims.creditsGranted >= 600, 'claim statistics do not trace the UAT grant');
+              assert(stats.anomalies.duplicateAttempts >= 1 && stats.anomalies.unpricedUsage >= 1, 'admin anomalies do not include duplicate/unpriced evidence');
+              assert(stats.recent.some(item => item.user?.id === user.id), 'admin recent ledger does not include the UAT user');
+
+              const balance = await ok('/token-packs/balance', { token: userToken }, 'credit balance');
+              const grants = await ok('/token-packs/credit-grants?limit=20', { token: userToken }, 'credit grant ledger');
+              assert(balance.remaining > 0 && balance.remaining <= 600, `unexpected post-provider balance ${balance.remaining}`);
+              assert(grants.some(item => item.id === claimed.grant.id && item.source === 'DAILY_CLAIM'), 'daily grant is missing from the user ledger');
+              assert(grants.some(item => item.id === makeup.grant.id && item.status === 'REVOKED'), 'revoked makeup grant is missing from the user ledger');
+
+              const billingProbe = await providerBillingProbe();
+              console.log(JSON.stringify({
+                credentials: { userId: user.id, userToken, adminToken },
+                report: {
+                  release: expectedRelease,
+                  testedAt: new Date().toISOString(),
+                  businessDate: initial.businessDate,
+                  timezone: initial.timezone,
+                  dailyClaim: {
+                    configuredAmount: initial.amount,
+                    firstGrantId: claimed.grant.id,
+                    sameKeyReplay: replay.idempotentReplay,
+                    differentKeyStatus: duplicate.response.status,
+                    remainingAfterRealProviderCall: balance.remaining,
+                  },
+                  permissions: {
+                    ordinaryAdminStats: deniedStats.response.status,
+                    ordinaryPricingVersions: deniedPricing.response.status,
+                    ordinaryAdminMakeup: deniedMakeup.response.status,
+                    adminStatsVisible: true,
+                  },
+                  grantControls: { makeupId: makeup.grant.id, sameKeyReplay: makeupReplay.idempotentReplay, finalStatus: 'REVOKED' },
+                  pricing: {
+                    originalVersion: original.version,
+                    testVersion: testVersion.version,
+                    rollbackVersion: rollbackVersion.version,
+                    historical: publicLog(historical),
+                    newlyPriced: publicLog(priced),
+                    afterRollback: publicLog(rolled),
+                    immutableMutationRejected: true,
+                  },
+                  realProviderLedger: publicLog(realUsage),
+                  providerBillingAccess: billingProbe,
+                  adminMetrics: {
+                    people: stats.claims.people,
+                    count: stats.claims.count,
+                    creditsGranted: stats.claims.creditsGranted,
+                    duplicateAttempts: stats.anomalies.duplicateAttempts,
+                    unpricedUsage: stats.anomalies.unpricedUsage,
+                  },
+                },
+              }));
+            } finally {
+              if (testVersion && !rollbackVersion) {
+                const current = await pricingService.getEffectiveVersion(new Date());
+                if (current?.id === testVersion.id) {
+                  rollbackVersion = await pricingService.rollback(admin.id, original.id, { reason: `${marker}: recovery rollback` }, new Date());
+                }
+              }
+            }
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+
+          E2E_USER_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).credentials.userId)')
+          E2E_USER_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).credentials.userToken)')
+          E2E_ADMIN_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).credentials.adminToken)')
+          echo "::add-mask::$E2E_USER_TOKEN"
+          echo "::add-mask::$E2E_ADMIN_TOKEN"
+          echo "E2E_USER_ID=$E2E_USER_ID" >> "$GITHUB_ENV"
+          echo "E2E_USER_TOKEN=$E2E_USER_TOKEN" >> "$GITHUB_ENV"
+          echo "E2E_ADMIN_TOKEN=$E2E_ADMIN_TOKEN" >> "$GITHUB_ENV"
+          UAT_JSON="$uat_json" node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(process.env.UAT_JSON);
+            fs.writeFileSync("uat-artifacts/server-uat.json", `${JSON.stringify(value.report, null, 2)}\n`);
+          '
+
+      - name: Run real production browser UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          E2E_EVIDENCE_DIR: uat-artifacts
+        run: node .github/e2e/production-credit-pricing.cjs
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: credit-pricing-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove isolated production UAT user
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${E2E_UAT_PHONE:-}" ]; then
+            echo 'No UAT identity was allocated; cleanup is unnecessary.'
+            exit 0
+          fi
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "SOURCE_SHA='$SOURCE_SHA' E2E_USER_ID='${E2E_USER_ID:-}' E2E_UAT_PHONE='$E2E_UAT_PHONE' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          TARGET_RELEASE="$APP_ROOT/releases/$SOURCE_SHA"
+          test -d "$TARGET_RELEASE"
+          cd "$TARGET_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          (async () => {
+            const selectors = [{ phone: process.env.E2E_UAT_PHONE }];
+            if (process.env.E2E_USER_ID) selectors.push({ id: process.env.E2E_USER_ID });
+            const users = await prisma.user.findMany({ where: { OR: selectors }, select: { id: true } });
+            for (const { id: userId } of users) {
+              const grants = await prisma.creditGrant.findMany({ where: { userId }, select: { id: true } });
+              const grantIds = grants.map(item => item.id);
+              const logs = await prisma.tokenUsageLog.findMany({ where: { userId }, select: { id: true } });
+              const logIds = logs.map(item => item.id);
+              if (logIds.length) await prisma.providerBillSample.deleteMany({ where: { usageLogId: { in: logIds } } });
+              if (grantIds.length) await prisma.creditGrantEvent.deleteMany({ where: { grantId: { in: grantIds } } });
+              await prisma.tokenUsageLog.deleteMany({ where: { userId } });
+              await prisma.creditReservation.deleteMany({ where: { userId } });
+              await prisma.creditGrant.deleteMany({ where: { userId } });
+              await prisma.dailyTokenUsage.deleteMany({ where: { userId } });
+              await prisma.aiGeneration.updateMany({ where: { userId }, data: { relatedId: null } });
+              await prisma.aiGeneration.deleteMany({ where: { userId } });
+              await prisma.aiConversation.deleteMany({ where: { userId } });
+              await prisma.businessProfile.deleteMany({ where: { userId } });
+              await prisma.feedback.deleteMany({ where: { userId } });
+              await prisma.activationCode.deleteMany({ where: { userId } });
+              await prisma.transaction.deleteMany({ where: { userId } });
+              await prisma.tokenPack.deleteMany({ where: { userId } });
+              await prisma.user.deleteMany({ where: { id: userId } });
+            }
+            const remaining = await prisma.user.count({ where: { OR: selectors } });
+            if (remaining !== 0) throw new Error(`UAT cleanup left ${remaining} users`);
+            console.log(`production_uat_users_removed=${users.length}`);
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+
+      - name: Record production credit-pricing acceptance
+        run: |
+          echo 'production_credit_claim_uat=passed'
+          echo 'production_pricing_immutability_uat=passed'
+          echo 'production_provider_ledger_uat=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
