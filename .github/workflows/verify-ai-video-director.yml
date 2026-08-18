@@ -552,7 +552,34 @@ jobs:
               assert(retryUsage.length === 0, `${retryVideo.status} retry consumed credits`);
             }
             assert(!usage.some(item => item.referenceId === failedVideo.id), 'Seeded failed task consumed credits');
-            assert(!reservations.some(item => [failedVideo.id, retryVideo.id, successfulVideo.id].includes(item.referenceId)), 'A video reservation remains');
+            const successReservation = reservations.find(item => item.referenceId === successfulVideo.id);
+            const failedReservation = reservations.find(item => item.referenceId === failedVideo.id);
+            const retryReservation = reservations.find(item => item.referenceId === retryVideo.id);
+            assert(
+              successReservation?.status === 'SETTLED'
+                && successReservation.amount === 400
+                && successReservation.settledAt
+                && !successReservation.releasedAt
+                && successReservation.pricingVersionId
+                && successReservation.pricingCapturedAt,
+              `Successful reservation state ${successReservation?.status}/${successReservation?.amount}`,
+            );
+            assert(!failedReservation, 'Seeded failed task unexpectedly has a reservation');
+            const expectedRetryReservationStatus = retryVideo.status === 'COMPLETED' ? 'SETTLED' : 'RELEASED';
+            assert(
+              retryReservation?.status === expectedRetryReservationStatus
+                && retryReservation.amount === 400
+                && retryReservation.pricingVersionId
+                && retryReservation.pricingCapturedAt,
+              `Retry reservation state ${retryReservation?.status}/${retryReservation?.amount}`,
+            );
+            if (expectedRetryReservationStatus === 'SETTLED') {
+              assert(retryReservation.settledAt && !retryReservation.releasedAt, 'Settled retry reservation timestamps are invalid');
+            } else {
+              assert(retryReservation.releasedAt && !retryReservation.settledAt, 'Released retry reservation timestamps are invalid');
+            }
+            assert(!reservations.some(item => item.status === 'RESERVED'), 'An active credit reservation remains');
+            assert(reservations.length === 2, `Unexpected reservation audit row count ${reservations.length}`);
             const persistedImageOnly = messages.find(message => (
               message.role === 'user'
               && message.content === ''
@@ -603,7 +630,15 @@ jobs:
                 pricingVersionHash: pseudonym(item.pricingVersionId), inputTokens: item.inputTokens,
                 outputTokens: item.outputTokens, durationMs: item.durationMs,
               })),
+              reservations: reservations.map(item => ({
+                reservationHash: pseudonym(item.id), referenceHash: pseudonym(item.referenceId),
+                status: item.status, amount: item.amount,
+                pricingVersionHash: pseudonym(item.pricingVersionId),
+                hasPricingSnapshot: Boolean(item.pricingCapturedAt),
+                hasSettledAt: Boolean(item.settledAt), hasReleasedAt: Boolean(item.releasedAt),
+              })),
               reservationCount: reservations.length,
+              activeReservationCount: reservations.filter(item => item.status === 'RESERVED').length,
               chargedCredits: charged,
             }));
           })().finally(() => prisma.$disconnect());
