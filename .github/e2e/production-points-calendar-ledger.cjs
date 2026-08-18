@@ -311,6 +311,9 @@ async function verifyMobile(browser) {
     await toggle.focus();
     await page.keyboard.press('Space');
     await page.locator('#credit-ledger-details').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => ['EARN', 'SPEND', 'RESERVE', 'REFUND'].every(type =>
+      document.querySelector(`[data-ledger-type="${type}"]`),
+    ));
     assert((await toggle.getAttribute('aria-expanded')) === 'true', 'mobile: Space did not expand ledger');
     assert(observed.apiRequests.filter(item => item.startsWith('GET /api/token-packs/ledger')).length === 1, 'mobile: first expansion did not make exactly one ledger request');
     assert((await page.locator('[data-ledger-type="EARN"]').count()) > 0, 'mobile: earned entry missing');
