@@ -1,5 +1,5 @@
 name: Verify Zhiduoduo AI Video Director Production
-run-name: "verify ai-video-director ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+run-name: "verify ai-video-director ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
 
 on:
   workflow_dispatch:
@@ -9,6 +9,9 @@ on:
         required: true
       release_run_id:
         description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing the UAT assertions
         required: true
 
 permissions:
@@ -29,10 +32,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
         run: |
           set -Eeuo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
           run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
           RUN="$run" node -e '
@@ -47,7 +52,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Infinity-light/ai-agent-distro
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ inputs.harness_sha }}
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           path: source
 
