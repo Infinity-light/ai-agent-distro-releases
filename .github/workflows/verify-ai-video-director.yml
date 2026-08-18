@@ -196,6 +196,17 @@ jobs:
             });
 
             const model = 'doubao-seedance-2-0-mini-260615';
+            const pricingCapturedAt = new Date();
+            const pricingVersion = await prisma.modelPricingVersion.findFirst({
+              where: { effectiveAt: { lte: pricingCapturedAt } },
+              orderBy: [{ effectiveAt: 'desc' }, { version: 'desc' }],
+              select: { id: true },
+            });
+            assert(pricingVersion?.id, 'Production UAT requires an effective immutable pricing version');
+            const pricingSnapshot = {
+              pricingVersionId: pricingVersion.id,
+              pricingCapturedAt: pricingCapturedAt.toISOString(),
+            };
             const shots = [
               { startSeconds: 0, endSeconds: 1, purpose: '钩子', visual: '微距咖啡蒸汽在暖色晨光中升起', camera: '稳定微距轻推' },
               { startSeconds: 1, endSeconds: 2, purpose: '动作', visual: '光线从左向右扫过白色杯沿', camera: '近景横移' },
@@ -216,11 +227,13 @@ jobs:
               materialIds,
               confirmedByUser: true,
               confirmedCreditCost: 400,
+              ...pricingSnapshot,
             });
             const quote = (title, materialIds, args) => ({
               type: 'video_quote', mode: 'single', title,
               model, modelName: 'Seedance 2.0 Mini', ratio: '9:16', resolution: '720p',
               durations: [4], totalDuration: 4, segmentCredits: [400], totalCreditCost: 400, materialIds,
+              ...pricingSnapshot,
               confirmation: { toolName: 'generate_video', arguments: args },
             });
             const mainConversation = await prisma.aiConversation.create({
@@ -245,7 +258,8 @@ jobs:
                     ratio: quoteData.ratio, resolution: quoteData.resolution,
                     durations: quoteData.durations, totalDuration: quoteData.totalDuration,
                     segmentCredits: quoteData.segmentCredits, totalCreditCost: quoteData.totalCreditCost,
-                    materialIds: quoteData.materialIds,
+                    materialIds: quoteData.materialIds, pricingVersionId: quoteData.pricingVersionId,
+                    pricingCapturedAt: quoteData.pricingCapturedAt,
                   },
                 } : {}),
               };
