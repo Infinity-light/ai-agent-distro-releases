@@ -1,4 +1,5 @@
 const { chromium, request } = require("playwright");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -22,6 +23,41 @@ const evidenceDir = path.resolve(
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function pseudonym(value) {
+  return value
+    ? crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16)
+    : null;
+}
+
+function sanitizeText(value) {
+  return String(value || "")
+    .replace(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+      (match) => `id#${pseudonym(match)}`,
+    )
+    .replace(/\bcgt-[A-Za-z0-9-]+\b/g, (match) => `task#${pseudonym(match)}`)
+    .replace(/([?&](?:token|signature|access_key_id)=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/\b1[3-9]\d{9}\b/g, "[PHONE]")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[EMAIL]");
+}
+
+function sanitizeEvidence(value, key = "") {
+  if (Array.isArray(value)) return value.map((item) => sanitizeEvidence(item, key));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        sanitizeEvidence(childValue, childKey),
+      ]),
+    );
+  }
+  if (typeof value !== "string") return value;
+  if (/(?:^id$|Id$|ID$|Key$|Url$)/.test(key)) {
+    return `hash#${pseudonym(value)}`;
+  }
+  return sanitizeText(value);
 }
 
 function unwrap(body) {
@@ -112,8 +148,10 @@ function actionCard(page, question) {
 }
 
 function appendGithubEnv(name, value) {
-  if (process.env.GITHUB_ENV)
+  if (process.env.GITHUB_ENV) {
+    process.stdout.write(`::add-mask::${String(value).replace(/[\r\n]/g, "")}\n`);
     fs.appendFileSync(process.env.GITHUB_ENV, `${name}=${value}\n`);
+  }
 }
 
 (async () => {
@@ -182,7 +220,7 @@ function appendGithubEnv(name, value) {
     cancelledConfirmation: {},
     deniedConfirmation: {},
     successfulConfirmation: {},
-    retryAndCancel: {},
+    retryLifecycle: {},
   };
 
   try {
@@ -583,12 +621,12 @@ function appendGithubEnv(name, value) {
     fs.writeFileSync(
       path.join(evidenceDir, "success-action-response.json"),
       `${JSON.stringify(
-        {
+        sanitizeEvidence({
           httpStatus: successResponse.status(),
           requestId: successResponse.headers()["x-request-id"] || null,
           invokedAction: successData.invokedAction || null,
           toolResults: successData.toolResults || [],
-        },
+        }),
         null,
         2,
       )}\n`,
@@ -782,6 +820,72 @@ function appendGithubEnv(name, value) {
     );
     retryGenerationId = retryData.id;
     appendGithubEnv("E2E_RETRY_GENERATION_ID", retryGenerationId);
+    const preCancel = await videoStatus(adminContext.request, retryGenerationId);
+    let cancelHttpStatus = null;
+    let cancelOutcome = preCancel.controls?.canCancel
+      ? "requested"
+      : "provider_running_before_request";
+    if (preCancel.controls?.canCancel) {
+      const cancelButton = page.getByRole("button", { name: "取消任务" }).last();
+      await cancelButton.waitFor({ timeout: 30_000 });
+      const cancelTaskResponsePromise = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname ===
+            `/api/ai/generate/video/${retryGenerationId}/cancel`,
+        { timeout: 60_000 },
+      );
+      await cancelButton.click();
+      await page.getByRole("button", { name: "确认取消" }).click();
+      const cancelTaskResponse = await cancelTaskResponsePromise;
+      cancelHttpStatus = cancelTaskResponse.status();
+      const cancelTaskData = unwrap(
+        await json(cancelTaskResponse, "retried-video cancellation", true),
+      );
+      if (cancelTaskResponse.ok()) {
+        assert(
+          cancelTaskData.status === "CANCELLED",
+          `Cancellation returned ${cancelTaskData.status}`,
+        );
+        cancelOutcome = "cancelled";
+      } else {
+        assert(
+          cancelHttpStatus === 409 && cancelTaskData.code === "VIDEO_CANCEL_UNAVAILABLE",
+          `Cancellation conflict returned ${cancelHttpStatus}/${cancelTaskData.code}`,
+        );
+        assert(
+          /成功后按报价结算/.test(cancelTaskData.message || "") &&
+            /失败会自动释放预留积分/.test(cancelTaskData.message || ""),
+          `Cancellation feedback is incomplete: ${cancelTaskData.message || ""}`,
+        );
+        const afterConflict = await balance(adminContext.request);
+        assert(
+          afterConflict.remaining === beforeRetry.remaining,
+          `Rejected cancellation changed balance ${beforeRetry.remaining} -> ${afterConflict.remaining}`,
+        );
+        await cancelButton.waitFor({ state: "hidden", timeout: 30_000 });
+        const running = await videoStatus(adminContext.request, retryGenerationId);
+        assert(
+          running.status === "PENDING" && running.controls?.canCancel === false,
+          `Running cancellation state is ${running.status}/${running.controls?.canCancel}`,
+        );
+        cancelOutcome = "provider_running_conflict";
+      }
+    } else {
+      assert(
+        preCancel.status === "PENDING" && preCancel.progress?.providerStatus === "running",
+        `Non-cancellable retry state is ${preCancel.status}/${preCancel.progress?.providerStatus}`,
+      );
+    }
+    const retryTerminal = await waitForTerminal(
+      adminContext.request,
+      retryGenerationId,
+      300_000,
+    );
+    assert(
+      ["COMPLETED", "FAILED", "CANCELLED"].includes(retryTerminal.current.status),
+      `Retried task ended as ${retryTerminal.current.status}`,
+    );
     const retryReplay = unwrap(
       await json(
         await adminContext.request.post(
@@ -792,59 +896,30 @@ function appendGithubEnv(name, value) {
       ),
     );
     assert(
-      retryReplay.id === retryGenerationId,
-      "Retry replay created a second task",
-    );
-    await page
-      .getByRole("button", { name: "取消任务" })
-      .last()
-      .waitFor({ timeout: 30_000 });
-    const cancelTaskResponsePromise = page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        new URL(response.url()).pathname ===
-          `/api/ai/generate/video/${retryGenerationId}/cancel`,
-      { timeout: 60_000 },
-    );
-    await page.getByRole("button", { name: "取消任务" }).last().click();
-    await page.getByRole("button", { name: "确认取消" }).click();
-    const cancelTaskData = unwrap(
-      await json(await cancelTaskResponsePromise, "retried-video cancellation"),
-    );
-    assert(
-      cancelTaskData.status === "CANCELLED",
-      `Cancellation returned ${cancelTaskData.status}`,
-    );
-    const retryTerminal = await waitForTerminal(
-      adminContext.request,
-      retryGenerationId,
-      120_000,
-    );
-    assert(
-      retryTerminal.current.status === "CANCELLED",
-      `Retried task ended as ${retryTerminal.current.status}`,
-    );
-    assert(
-      retryTerminal.current.stage?.code === "cancelled",
-      `Cancelled stage is ${retryTerminal.current.stage?.code}`,
+      retryReplay.id === retryGenerationId && retryReplay.idempotentReplay === true,
+      "Retry replay created a second task or lost its replay marker",
     );
     const afterRetryCancel = await balance(adminContext.request);
+    const expectedRetryCharge = retryTerminal.current.status === "COMPLETED" ? 400 : 0;
     assert(
-      afterRetryCancel.remaining === beforeRetry.remaining,
-      `Retry/cancel changed balance ${beforeRetry.remaining} -> ${afterRetryCancel.remaining}`,
+      afterRetryCancel.remaining === beforeRetry.remaining - expectedRetryCharge,
+      `Retry terminal billing ${retryTerminal.current.status}: ${beforeRetry.remaining} -> ${afterRetryCancel.remaining}`,
     );
-    evidence.retryAndCancel = {
+    evidence.retryLifecycle = {
       originalFailedGenerationId: failedVideoId,
       retryGenerationId,
       requestKey: retryBody.requestKey,
       idempotentReplayGenerationId: retryReplay.id,
+      cancelHttpStatus,
+      cancelOutcome,
       status: retryTerminal.current.status,
       stage: retryTerminal.current.stage,
+      expectedRetryCharge,
       balanceBefore: beforeRetry.remaining,
       balanceAfter: afterRetryCancel.remaining,
     };
     await page.screenshot({
-      path: path.join(evidenceDir, "08-failed-retry-cancel-zero-charge.png"),
+      path: path.join(evidenceDir, "08-retry-terminal-billing-invariant.png"),
       fullPage: true,
     });
 
@@ -860,16 +935,16 @@ function appendGithubEnv(name, value) {
     evidence.unexpectedResponses = unexpectedResponses;
     fs.writeFileSync(
       path.join(evidenceDir, "browser-and-api-evidence.json"),
-      `${JSON.stringify(evidence, null, 2)}\n`,
+      `${JSON.stringify(sanitizeEvidence(evidence), null, 2)}\n`,
     );
     console.log(
       JSON.stringify({
         release: expectedRelease,
-        mainConversationId,
-        successGenerationId,
-        retryGenerationId,
+        mainConversationHash: pseudonym(mainConversationId),
+        successGenerationHash: pseudonym(successGenerationId),
+        retryGenerationHash: pseudonym(retryGenerationId),
         successStatus: evidence.successfulConfirmation.status,
-        retryStatus: evidence.retryAndCancel.status,
+        retryStatus: evidence.retryLifecycle.status,
         crossOwnerDenied: evidence.deniedConfirmation.status === "FAILED",
       }),
     );

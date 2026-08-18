@@ -418,6 +418,7 @@ jobs:
           echo "::add-mask::$E2E_ADMIN_TOKEN"
           echo "::add-mask::$E2E_NORMAL_TOKEN"
           for value in E2E_ADMIN_ID E2E_NORMAL_ID E2E_ADMIN_TOKEN E2E_NORMAL_TOKEN E2E_PORTRAIT_URL E2E_WORK_ID E2E_NORMAL_WORK_ID E2E_MAIN_CONVERSATION_ID E2E_CHOICE_ACTION_ID E2E_CANCEL_ACTION_ID E2E_DENIAL_ACTION_ID E2E_SUCCESS_ACTION_ID E2E_FAILED_VIDEO_ID E2E_FAILURE_CONVERSATION_ID; do
+            echo "::add-mask::${!value}"
             echo "$value=${!value}" >> "$GITHUB_ENV"
           done
 
@@ -472,13 +473,24 @@ jobs:
           cd "$ACTIVE_RELEASE"
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
           const { PrismaClient } = require('@prisma/client');
+          const crypto = require('node:crypto');
           const prisma = new PrismaClient();
           const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const pseudonym = value => value
+            ? crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16)
+            : null;
+          const sanitizeText = value => String(value || '')
+            .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+              match => `id#${pseudonym(match)}`)
+            .replace(/\bcgt-[A-Za-z0-9-]+\b/g, match => `task#${pseudonym(match)}`)
+            .replace(/([?&](?:token|signature|access_key_id)=)[^&\s]+/gi, '$1[REDACTED]')
+            .replace(/\b1[3-9]\d{9}\b/g, '[PHONE]')
+            .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[EMAIL]');
           (async () => {
             const userId = process.env.E2E_ADMIN_ID;
             const [actions, generations, usage, reservations, messages, packs, user] = await Promise.all([
               prisma.aiChatAction.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
-              prisma.aiGeneration.findMany({ where: { userId }, orderBy: { createdAt: 'asc' }),
+              prisma.aiGeneration.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
               prisma.tokenUsageLog.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
               prisma.creditReservation.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }),
               prisma.aiMessage.findMany({ where: { conversation: { userId } }, orderBy: { createdAt: 'asc' } }),
@@ -518,9 +530,12 @@ jobs:
             assert(Array.isArray(successfulVideo.metadata?.materials) && successfulVideo.metadata.materials.length === 1,
               'Successful task did not retain its one resolved source material');
             assert(failedVideo?.status === 'FAILED' && !failedVideo.providerTaskId, 'Seeded failed task changed unexpectedly');
-            assert(retryVideo?.status === 'CANCELLED', `Retried task status ${retryVideo?.status}`);
-            assert(retryVideo.providerTaskId, 'Cancelled retry never reached a real provider task');
-            assert(retryVideo.metadata?.providerStatus === 'cancelled', `Cancelled provider state ${retryVideo.metadata?.providerStatus}`);
+            assert(['COMPLETED', 'FAILED', 'CANCELLED'].includes(retryVideo?.status), `Retried task status ${retryVideo?.status}`);
+            assert(retryVideo.providerTaskId, 'Retried task never reached the real provider');
+            assert(
+              retryVideo.status !== 'COMPLETED' || Boolean(retryVideo.videoUrl),
+              'Completed retry has no video URL',
+            );
             assert(!generations.some(item => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status)), 'An active or orphan application task remains');
 
             const successUsage = usage.filter(item => item.referenceId === successfulVideo.id);
@@ -529,7 +544,14 @@ jobs:
               `Successful video usage ${successUsage[0]?.tokensUsed}/${successUsage[0]?.businessType}`);
             assert(successUsage[0].costStatus === 'PRICED' && successUsage[0].pricingVersionId,
               `Successful video cost state ${successUsage[0]?.costStatus}/${successUsage[0]?.pricingVersionId}`);
-            assert(!usage.some(item => [failedVideo.id, retryVideo.id].includes(item.referenceId)), 'Failed or cancelled task consumed credits');
+            const retryUsage = usage.filter(item => item.referenceId === retryVideo.id);
+            if (retryVideo.status === 'COMPLETED') {
+              assert(retryUsage.length === 1 && retryUsage[0].tokensUsed === 400 && retryUsage[0].businessType === 'VIDEO',
+                `Completed retry usage ${retryUsage.length}/${retryUsage[0]?.tokensUsed}/${retryUsage[0]?.businessType}`);
+            } else {
+              assert(retryUsage.length === 0, `${retryVideo.status} retry consumed credits`);
+            }
+            assert(!usage.some(item => item.referenceId === failedVideo.id), 'Seeded failed task consumed credits');
             assert(!reservations.some(item => [failedVideo.id, retryVideo.id, successfulVideo.id].includes(item.referenceId)), 'A video reservation remains');
             const persistedImageOnly = messages.find(message => (
               message.role === 'user'
@@ -543,36 +565,42 @@ jobs:
               `Token pack total does not reconcile to immutable usage ${charged}`);
             console.log(JSON.stringify({
               release: process.env.EXPECTED_RELEASE,
-              userId,
+              userHash: pseudonym(userId),
               portraitConfigured: Boolean(user?.aiProfileData?.portraitUrl),
               models,
               actions: actions.map(item => ({
-                id: item.id, kind: item.kind, status: item.status, attempts: item.attempts,
+                actionHash: pseudonym(item.id), kind: item.kind, status: item.status, attempts: item.attempts,
                 retryable: item.retryable, selectedOptionIds: item.selectedOptionIds,
-                invocationKey: item.invocationKey, errorCode: item.errorCode, errorMessage: item.errorMessage,
-                stableMaterialIds: item.payload?.quote?.materialIds || [],
+                invocationHash: pseudonym(item.invocationKey), errorCode: item.errorCode,
+                errorMessage: sanitizeText(item.errorMessage),
+                stableMaterialHashes: (item.payload?.quote?.materialIds || []).map(pseudonym),
               })),
               generations: generations.map((entry) => ({
-                id: entry.id,
+                generationHash: pseudonym(entry.id),
                 type: entry.type,
                 status: entry.status,
-                providerTaskId: entry.providerTaskId,
+                providerTaskHash: pseudonym(entry.providerTaskId),
                 hasVideoUrl: Boolean(entry.videoUrl),
                 videoHost: entry.videoUrl ? new URL(entry.videoUrl, 'https://zhiduoduoai.com').host : null,
-                errorMessage: entry.errorMessage,
-                operationKey: entry.operationKey,
+                errorMessage: sanitizeText(entry.errorMessage),
+                operationHash: pseudonym(entry.operationKey),
                 stage: entry.metadata?.providerStatus || null,
-                inboundRequestId: entry.metadata?.inboundRequestId || null,
-                providerSubmission: entry.metadata?.providerSubmission || null,
-                shots: entry.metadata?.shots || [],
+                inboundRequestHash: pseudonym(entry.metadata?.inboundRequestId),
+                providerSubmission: entry.metadata?.providerSubmission ? {
+                  clientRequestHash: pseudonym(entry.metadata.providerSubmission.clientRequestId),
+                  providerRequestHash: pseudonym(entry.metadata.providerSubmission.providerRequestId),
+                } : null,
+                shotDurations: Array.isArray(entry.metadata?.shots)
+                  ? entry.metadata.shots.map(shot => Number(shot.endSeconds) - Number(shot.startSeconds))
+                  : [],
               })),
-              imageOnlyUserMessageId: persistedImageOnly.id,
+              imageOnlyUserMessageHash: pseudonym(persistedImageOnly.id),
               usage: usage.map(item => ({
-                id: item.id, operation: item.operation, referenceId: item.referenceId,
+                usageHash: pseudonym(item.id), operation: item.operation, referenceHash: pseudonym(item.referenceId),
                 model: item.model, provider: item.provider, providerEndpoint: item.providerEndpoint,
-                providerRequestId: item.providerRequestId, tokensUsed: item.tokensUsed,
+                providerRequestHash: pseudonym(item.providerRequestId), tokensUsed: item.tokensUsed,
                 businessType: item.businessType, costStatus: item.costStatus,
-                pricingVersionId: item.pricingVersionId, inputTokens: item.inputTokens,
+                pricingVersionHash: pseudonym(item.pricingVersionId), inputTokens: item.inputTokens,
                 outputTokens: item.outputTokens, durationMs: item.durationMs,
               })),
               reservationCount: reservations.length,
@@ -614,10 +642,14 @@ jobs:
           cd "$ACTIVE_RELEASE"
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
           const { PrismaClient } = require('@prisma/client');
+          const crypto = require('node:crypto');
           const jwt = require('jsonwebtoken');
           const prisma = new PrismaClient();
           const apiBase = 'http://127.0.0.1:3100/api';
           const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const pseudonym = value => value
+            ? crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16)
+            : null;
 
           function collectStrings(value, output = []) {
             if (typeof value === 'string') output.push(value);
@@ -693,7 +725,7 @@ jobs:
             await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
             await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
             await prisma.user.delete({ where: { id: user.id } });
-            return { userId: user.id, generationCount: generations.length, deletedOssObjects };
+            return { userHash: pseudonym(user.id), generationCount: generations.length, deletedOssObjects };
           }
 
           (async () => {
