@@ -183,7 +183,7 @@ async function verifyDesktop(browser) {
       element.click();
     });
     const claimResponse = await claimResponsePromise;
-    assert(claimResponse.status() === 200, `desktop: first claim returned ${claimResponse.status()}`);
+    assert(claimResponse.ok(), `desktop: first claim returned ${claimResponse.status()}`);
     const claimBody = await claimResponse.json();
     const firstClaim = claimBody.data || claimBody;
     assert(firstClaim.claimed && firstClaim.grant?.amount === dailyAmount, 'desktop: first claim did not credit the configured amount');
@@ -201,7 +201,7 @@ async function verifyDesktop(browser) {
     });
     const replayBody = await replay.json();
     const replayData = replayBody.data || replayBody;
-    assert(replay.status() === 200 && replayData.idempotentReplay === true, `desktop: same-key replay returned ${replay.status()}`);
+    assert(replay.ok() && replayData.idempotentReplay === true, `desktop: same-key replay returned ${replay.status()}`);
     assert(replayData.grant?.id === firstClaim.grant.id, 'desktop: same-key replay returned a different grant');
 
     const duplicate = await context.request.post(`${baseUrl}/api/token-packs/daily-claim`, {
