@@ -251,7 +251,9 @@ function appendGithubEnv(name, value) {
 
     await page.addInitScript(
       ({ key, conversationId }) => {
-        localStorage.setItem(key, conversationId);
+        if (!localStorage.getItem(key)) {
+          localStorage.setItem(key, conversationId);
+        }
       },
       {
         key: `zdd-ai-chat:last:${adminId}`,
