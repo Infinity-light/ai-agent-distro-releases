@@ -108,7 +108,7 @@ jobs:
             });
             const body = await response.json();
             const data = body?.data ?? body;
-            assert(response.ok(), `${path} returned HTTP ${response.status}`);
+            assert(response.ok, `${path} returned HTTP ${response.status}`);
             return data;
           }
 
