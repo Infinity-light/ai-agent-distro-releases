@@ -43,11 +43,19 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      - name: Checkout immutable source UAT assertions
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
       - name: Install production browser acceptance runtime
         shell: bash
         run: |
           set -Eeuo pipefail
-          npm install --no-package-lock --no-save playwright@1.55.0
+          npm install --no-package-lock --no-save playwright@1.55.1
           PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
@@ -121,7 +129,7 @@ jobs:
                 isActivated: true,
                 aiPersona: 'PRODUCT_OWNER',
                 aiOnboardingDone: true,
-                tokenPacks: { create: { name: 'Director UAT Credits', totalTokens: 100000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
+                tokenPacks: { create: { name: 'Director UAT Credits', totalTokens: 5000, usedTokens: 0, price: 0, status: 'ACTIVE' } },
               },
             });
             const normal = await prisma.user.create({
@@ -393,6 +401,15 @@ jobs:
           for value in E2E_ADMIN_ID E2E_NORMAL_ID E2E_ADMIN_TOKEN E2E_NORMAL_TOKEN E2E_PORTRAIT_URL E2E_WORK_ID E2E_NORMAL_WORK_ID E2E_MAIN_CONVERSATION_ID E2E_CHOICE_ACTION_ID E2E_CANCEL_ACTION_ID E2E_DENIAL_ACTION_ID E2E_SUCCESS_ACTION_ID E2E_FAILED_VIDEO_ID E2E_FAILURE_CONVERSATION_ID; do
             echo "$value=${!value}" >> "$GITHUB_ENV"
           done
+
+      - name: Run live prose, quote, balance, and insufficient-credit UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          E2E_EVIDENCE_DIR: uat-artifacts
+          NODE_PATH: ${{ github.workspace }}/node_modules
+        run: node source/.github/e2e/production-video-flow-billing.cjs
 
       - name: Run complete real-account production UAT
         env:

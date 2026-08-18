@@ -46,7 +46,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          npm install --no-package-lock --no-save playwright@1.55.0
+          npm install --no-package-lock --no-save playwright@1.55.1
           PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
 
       - name: Run isolated API, ledger, permission, and pricing-version UAT

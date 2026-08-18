@@ -48,18 +48,23 @@ async function json(response, label, allowFailure = false) {
   return body;
 }
 
-function parseSse(text) {
-  return text
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => {
-      try {
-        return JSON.parse(line.slice(6));
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+async function waitForChatDelivery(api, requestKey) {
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    const response = await api.get(
+      `${baseUrl}/api/ai/chat/requests/${encodeURIComponent(requestKey)}`,
+    );
+    const delivery = unwrap(await json(response, "chat request status"));
+    if (delivery.status === "COMPLETED") {
+      assert(delivery.response?.assistantMessageId, "completed chat request has no assistant message");
+      return delivery;
+    }
+    if (["FAILED", "CANCELLED"].includes(delivery.status)) {
+      throw new Error(`chat request ended as ${delivery.status}: ${delivery.errorMessage || ""}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("chat request status did not become terminal");
 }
 
 async function balance(api) {
@@ -312,16 +317,10 @@ function appendGithubEnv(name, value) {
       imageOnlyResponse.status() === 200,
       `Image-only stream returned ${imageOnlyResponse.status()}`,
     );
-    const streamEvents = parseSse(await imageOnlyResponse.text());
-    const streamError = streamEvents.find((event) => event.type === "error");
-    const streamDone = streamEvents.findLast((event) => event.type === "done");
-    assert(
-      !streamError,
-      `Image-only stream failed: ${JSON.stringify(streamError)}`,
-    );
-    assert(
-      streamDone?.payload?.assistantMessageId,
-      "Image-only stream did not produce a persisted assistant message",
+    assert(imageOnlyBody.requestKey, "Image-only request has no request key");
+    const imageOnlyDelivery = await waitForChatDelivery(
+      adminContext.request,
+      imageOnlyBody.requestKey,
     );
     const conversationAfterImage = unwrap(
       await json(
@@ -350,9 +349,10 @@ function appendGithubEnv(name, value) {
     );
     evidence.imageOnly = {
       requestBody: imageOnlyBody,
-      assistantMessageId: streamDone.payload.assistantMessageId,
+      assistantMessageId: imageOnlyDelivery.response.assistantMessageId,
       persistedUserMessageId: imageOnlyUserMessage.id,
-      streamEventTypes: streamEvents.map((event) => event.type),
+      requestStatus: imageOnlyDelivery.status,
+      streamMode: imageOnlyDelivery.streamMode,
     };
     await page.screenshot({
       path: path.join(evidenceDir, "02-image-only-real-deepseek-response.png"),
