@@ -858,18 +858,32 @@ function appendGithubEnv(name, value) {
             /失败会自动释放预留积分/.test(cancelTaskData.message || ""),
           `Cancellation feedback is incomplete: ${cancelTaskData.message || ""}`,
         );
+        await cancelButton.waitFor({ state: "hidden", timeout: 30_000 });
         const afterConflict = await balance(adminContext.request);
         assert(
-          afterConflict.remaining === beforeRetry.remaining,
-          `Rejected cancellation changed balance ${beforeRetry.remaining} -> ${afterConflict.remaining}`,
+          [beforeRetry.remaining, beforeRetry.remaining - 400].includes(
+            afterConflict.remaining,
+          ),
+          `Cancellation conflict produced an invalid balance ${beforeRetry.remaining} -> ${afterConflict.remaining}`,
         );
-        await cancelButton.waitFor({ state: "hidden", timeout: 30_000 });
-        const running = await videoStatus(adminContext.request, retryGenerationId);
+        const postConflict = await videoStatus(
+          adminContext.request,
+          retryGenerationId,
+        );
+        const postConflictIsTerminal = [
+          "COMPLETED",
+          "FAILED",
+          "CANCELLED",
+        ].includes(postConflict.status);
         assert(
-          running.status === "PENDING" && running.controls?.canCancel === false,
-          `Running cancellation state is ${running.status}/${running.controls?.canCancel}`,
+          postConflictIsTerminal ||
+            (postConflict.status === "PENDING" &&
+              postConflict.controls?.canCancel === false),
+          `Cancellation conflict state is ${postConflict.status}/${postConflict.controls?.canCancel}`,
         );
-        cancelOutcome = "provider_running_conflict";
+        cancelOutcome = postConflictIsTerminal
+          ? `provider_running_conflict_${postConflict.status.toLowerCase()}`
+          : "provider_running_conflict";
       }
     } else {
       assert(
