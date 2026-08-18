@@ -91,19 +91,20 @@ async function verifyUser(browser) {
       new URL(page.url()).pathname === "/chat",
       `user was redirected to ${page.url()}`,
     );
-    await page.getByLabel("每日积分领取").click();
+    await page.getByLabel("每日积分礼包，今日已领取").click();
     const dialog = page.getByRole("dialog");
     await dialog.waitFor({ state: "visible", timeout: 20_000 });
-    await dialog.getByText("600 积分", { exact: false }).first().waitFor();
-    const claimed = dialog.getByRole("button", { name: "今日已领取" });
+    await dialog.getByText("福气已入账", { exact: true }).waitFor();
+    const claimed = dialog.getByRole("button", { name: "今日礼包已领取" });
     assert(
       await claimed.isDisabled(),
       "daily claim is not shown as completed after the API UAT",
     );
-    await dialog
-      .getByText(/剩余 \d+，已用 \d+/)
-      .first()
-      .waitFor();
+    await dialog.getByText("当前可用积分", { exact: true }).waitFor();
+    const ledgerToggle = dialog.getByRole("button", { name: "展开流水" });
+    assert(await ledgerToggle.getAttribute("aria-expanded") === "false", "credit ledger was not collapsed by default");
+    await ledgerToggle.click();
+    await dialog.getByLabel("积分流水明细").waitFor({ timeout: 20_000 });
     await page.screenshot({
       path: path.join(evidenceDir, "production-user-daily-claim.png"),
       fullPage: true,
