@@ -7,6 +7,7 @@ const expectedRelease = process.env.EXPECTED_RELEASE;
 const authToken = process.env.E2E_TOKEN;
 const runId = process.env.GITHUB_RUN_ID || String(Date.now());
 const evidenceDir = path.resolve(process.env.E2E_EVIDENCE_DIR || 'uat-artifacts');
+const forbiddenWaitingText = /实际进度|上游|provider|upstream|confidence|置信度|按当前任务/i;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -57,7 +58,11 @@ function safeVideoReference(value) {
   const page = await context.newPage();
   const unexpectedServerErrors = [];
   const pageErrors = [];
+  const consoleErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
   page.on('response', response => {
     const pathname = new URL(response.url()).pathname;
     const expectedProviderRejection = pathname === '/api/ai/generate/video' && response.request().method() === 'POST';
@@ -99,7 +104,7 @@ function safeVideoReference(value) {
     assert(failureBody.providerClientRequestId, 'Provider rejection did not return the outbound request ID');
     failedGenerationId = failureBody.generationId;
     fs.appendFileSync(process.env.GITHUB_ENV, `UAT_FAILED_GENERATION_ID=${failedGenerationId}\n`);
-    await page.getByText('视频任务未被上游受理', { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText('视频任务未能开始', { exact: true }).waitFor({ timeout: 20_000 });
     const failedStatus = await status(context, failedGenerationId);
     assert(failedStatus.status === 'FAILED', `Rejected generation is ${failedStatus.status}, expected FAILED`);
     assert(!failedStatus.metadata?.providerTaskId && !failedStatus.providerTaskId, 'Rejected generation retained an upstream provider task');
@@ -134,8 +139,19 @@ function safeVideoReference(value) {
     const submissionRequestId = successResponse.headers()['x-request-id'];
     assert(submissionRequestId, 'Successful submission response lacks X-Request-Id');
 
-    await page.getByText(/实际进度：/).waitFor({ timeout: 20_000 });
-    await page.getByText(/已耗时：/).waitFor({ timeout: 20_000 });
+    const progressComponent = page.locator('.video-job-progress');
+    await progressComponent.waitFor({ timeout: 20_000 });
+    const progressbar = page.getByRole('progressbar', { name: '视频生成进度' });
+    assert(await progressbar.count() === 1, 'Waiting UI must expose exactly one progressbar');
+    assert(await progressbar.getAttribute('aria-valuenow') === '0', 'New short video must start from persisted 0 percent');
+    assert(await progressbar.getAttribute('aria-valuetext') === '0/1 个片段已完成', 'Progressbar ARIA text is not event-backed');
+    const waitingText = await progressComponent.innerText();
+    assert(waitingText.includes('正在生成视频') && waitingText.includes('0/1'), `Unexpected waiting headline: ${waitingText}`);
+    assert(!forbiddenWaitingText.test(waitingText), `Waiting UI leaked internal wording: ${waitingText}`);
+    assert(await page.getByText(/预计还需/).count() === 0, 'ETA should be hidden without stable samples');
+    await page.getByText('查看进度详情').click();
+    await page.getByText('已耗时', { exact: true }).waitFor({ timeout: 10_000 });
+    await page.getByText('当前步骤', { exact: true }).waitFor({ timeout: 10_000 });
     await page.screenshot({ path: path.join(evidenceDir, '02-provider-backed-progress.png'), fullPage: true });
 
     const snapshots = [];
@@ -144,7 +160,24 @@ function safeVideoReference(value) {
     assert(current.stage?.code && current.stage?.label, 'Pending task has no backend stage');
     assert(current.progress && Number.isFinite(current.progress.totalUnits), 'Pending task has no backend progress');
     assert(current.timing && Number.isFinite(current.timing.elapsedSeconds), 'Pending task has no backend elapsed time');
-    assert(current.timing.eta?.basis, 'Pending task has no evidence-based ETA basis');
+    assert(current.progress.percent === 0 && current.progress.state !== 'succeeded', 'Pending task reported false completion');
+    assert(current.timing.eta === null, 'One-sample task should not expose an ETA');
+
+    await page.reload({ waitUntil: 'networkidle', timeout: 45_000 });
+    const restored = await status(context, completedGenerationId);
+    assert(restored.progress.completedUnits >= current.progress.completedUnits, 'Refresh regressed persisted progress');
+    if (!['COMPLETED', 'FAILED', 'CANCELLED'].includes(restored.status)) {
+      const restoredProgress = page.locator('.video-job-progress');
+      await restoredProgress.waitFor({ timeout: 20_000 });
+      const restoredText = await restoredProgress.innerText();
+      assert(restoredText.includes(`${restored.progress.completedUnits}/${restored.progress.totalUnits}`), 'Refresh did not restore the persisted count');
+      assert(!forbiddenWaitingText.test(restoredText), 'Refresh restored internal waiting text');
+      await page.setViewportSize({ width: 375, height: 812 });
+      const box = await restoredProgress.evaluate(element => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth }));
+      assert(box.scrollWidth <= box.clientWidth, `Mobile progress overflow ${box.scrollWidth} > ${box.clientWidth}`);
+      await page.screenshot({ path: path.join(evidenceDir, '02b-provider-progress-mobile.png'), fullPage: true });
+      await page.setViewportSize({ width: 1440, height: 1000 });
+    }
 
     if (!['COMPLETED', 'FAILED', 'CANCELLED'].includes(current.status)) {
       const resumeButton = page.getByRole('button', { name: '刷新并恢复' });
@@ -170,6 +203,7 @@ function safeVideoReference(value) {
     const afterSuccess = await balance(context);
     assert(afterSuccess.remaining === before.remaining - 400, `Completed task balance expected ${before.remaining - 400}, got ${afterSuccess.remaining}`);
     assert(pageErrors.length === 0, `Production page errors: ${pageErrors.join(' | ')}`);
+    assert(consoleErrors.length === 0, `Production console errors: ${consoleErrors.join(' | ')}`);
     assert(unexpectedServerErrors.length === 0, `Unexpected production 5xx responses: ${unexpectedServerErrors.join(' | ')}`);
 
     const evidence = {
