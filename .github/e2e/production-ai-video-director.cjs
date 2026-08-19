@@ -700,10 +700,21 @@ function appendGithubEnv(name, value) {
         Number.isFinite(initialStatus.timing.elapsedSeconds),
       "Confirmed task has no elapsed time",
     );
-    assert(
-      initialStatus.timing.eta?.basis,
-      "Confirmed task has no evidence-based ETA",
-    );
+    if (initialStatus.timing.eta) {
+      assert(
+        Number.isFinite(initialStatus.timing.eta.remainingSeconds) &&
+          Number(initialStatus.timing.eta.sampleSize) >= 2 &&
+          ["current_task", "same_spec_history"].includes(
+            initialStatus.timing.eta.source,
+          ),
+        `Confirmed task has an invalid ETA ${JSON.stringify(initialStatus.timing.eta)}`,
+      );
+      assert(
+        !("basis" in initialStatus.timing.eta) &&
+          !("confidence" in initialStatus.timing.eta),
+        "Confirmed task exposed internal ETA scoring fields",
+      );
+    }
     const resumeButton = page
       .getByRole("button", { name: "刷新并恢复" })
       .last();
