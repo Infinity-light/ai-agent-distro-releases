@@ -666,11 +666,20 @@ function appendGithubEnv(name, value) {
     );
 
     await page
-      .getByText(/实际进度：/)
+      .getByRole("progressbar", { name: "视频生成进度" })
+      .last()
+      .waitFor({ timeout: 30_000 });
+    const progressDetails = page
+      .getByText("查看进度详情", { exact: true })
+      .last();
+    await progressDetails.waitFor({ timeout: 30_000 });
+    await progressDetails.click();
+    await page
+      .getByText("已耗时", { exact: true })
       .last()
       .waitFor({ timeout: 30_000 });
     await page
-      .getByText(/已耗时：/)
+      .getByText("当前步骤", { exact: true })
       .last()
       .waitFor({ timeout: 30_000 });
     const initialStatus = await videoStatus(
