@@ -806,8 +806,12 @@ function appendGithubEnv(name, value) {
       timeout: 60_000,
     });
     await page
-      .getByText("生产验收：上游明确返回失败，可安全重试")
+      .getByText("这次视频没有生成成功，请调整方案后重试")
       .waitFor({ timeout: 30_000 });
+    assert(
+      (await page.getByText(/生产验收：上游明确返回失败|provider|供应商/i).count()) === 0,
+      "The failed-task card exposed internal provider diagnostics",
+    );
     const beforeRetry = await balance(adminContext.request);
     const retryRequestPromise = page.waitForRequest(
       (request) =>
@@ -907,8 +911,8 @@ function appendGithubEnv(name, value) {
       }
     } else {
       assert(
-        preCancel.status === "PENDING" && preCancel.progress?.providerStatus === "running",
-        `Non-cancellable retry state is ${preCancel.status}/${preCancel.progress?.providerStatus}`,
+        preCancel.status === "PENDING" && preCancel.controls?.canCancel === false,
+        `Non-cancellable retry state is ${preCancel.status}/${preCancel.controls?.canCancel}`,
       );
     }
     const retryTerminal = await waitForTerminal(
