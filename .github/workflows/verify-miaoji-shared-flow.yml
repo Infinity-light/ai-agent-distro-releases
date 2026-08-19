@@ -1,0 +1,470 @@
+name: Verify Zhiduoduo Miaoji Shared Flow Production
+run-name: "verify miaoji-shared ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing the UAT assertions
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-miaoji-shared-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate bound production release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+
+      - name: Checkout immutable source UAT harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Create scoped UAT account, reference image, and historical protocol fixture
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="miaoji-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          uat_raw=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const sharp = require('sharp');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+
+          function assert(condition, message) {
+            if (!condition) throw new Error(message);
+          }
+
+          async function responseData(response, label) {
+            const body = await response.json();
+            if (!response.ok || (body.code !== undefined && body.code !== 0)) {
+              throw new Error(`${label} failed with ${response.status}: ${JSON.stringify(body).slice(0, 700)}`);
+            }
+            return body.data ?? body;
+          }
+
+          (async () => {
+            const health = await responseData(await fetch(`${apiBase}/health`), 'health');
+            assert(health.release === process.env.EXPECTED_RELEASE, `Active release is ${health.release}`);
+            const suffix = `${process.env.E2E_UAT_PREFIX}-${Date.now()}`;
+            const user = await prisma.user.create({
+              data: {
+                phone: suffix,
+                email: `${suffix}@test.local`,
+                passwordHash: 'disabled-production-miaoji-uat',
+                name: '妙记共享链路生产验收',
+                role: 'PLATFORM_ADMIN',
+                isActivated: true,
+                aiPersona: 'PRODUCT_OWNER',
+                aiOnboardingDone: true,
+                tokenPacks: {
+                  create: { name: 'Miaoji UAT Credits', totalTokens: 100000, usedTokens: 0, price: 0, status: 'ACTIVE' },
+                },
+              },
+            });
+            const token = jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '45m' },
+            );
+            const portraitSvg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="768" height="768" viewBox="0 0 768 768">
+              <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dbeafe"/><stop offset="1" stop-color="#172554"/></linearGradient></defs>
+              <rect width="768" height="768" rx="48" fill="url(#bg)"/>
+              <circle cx="384" cy="278" r="132" fill="#f8d7c0"/>
+              <path d="M250 250c18-122 258-132 278 8-36-48-90-70-151-67-57 2-98 20-127 59z" fill="#241f2b"/>
+              <path d="M168 710c22-205 114-293 216-293s194 88 216 293" fill="#f8fafc"/>
+              <path d="M284 454l100 96 100-96 62 256H222z" fill="#1e3a8a"/>
+              <text x="384" y="670" text-anchor="middle" font-family="Arial,sans-serif" font-size="38" fill="#f8fafc">SHIRLEY UAT</text>
+            </svg>`);
+            const png = await sharp(portraitSvg).png({ compressionLevel: 9 }).toBuffer();
+            const form = new FormData();
+            form.append('file', new Blob([png], { type: 'image/png' }), 'miaoji-reference.png');
+            const uploaded = await responseData(await fetch(`${apiBase}/ai/chat/upload`, {
+              method: 'POST',
+              headers: { authorization: `Bearer ${token}` },
+              body: form,
+            }), 'reference upload');
+            assert(/^https:\/\//.test(uploaded.url) || /^\/api\/files\//.test(uploaded.url), `Unexpected image URL ${uploaded.url}`);
+            await prisma.user.update({
+              where: { id: user.id },
+              data: { aiProfileData: { uatReferenceImageUrl: uploaded.url } },
+            });
+
+            const conversation = await prisma.aiConversation.create({
+              data: { userId: user.id, title: '历史协议泄漏回归夹具' },
+            });
+            await prisma.aiMessage.createMany({
+              data: [
+                { conversationId: conversation.id, role: 'user', content: '显示历史回复', tokensUsed: 0 },
+                {
+                  conversationId: conversation.id,
+                  role: 'assistant',
+                  content: [
+                    '安全开头',
+                    '<｜DSML｜tool_calls>',
+                    '<｜DSML｜invoke name="generate_poster">',
+                    '{"title":"internal-only"}',
+                    '<｜DSML｜/invoke>',
+                    '<｜DSML｜/tool_calls>',
+                    'DSML to course failed: invalid invoke payload',
+                    '安全结尾',
+                  ].join('\n'),
+                  tokensUsed: 0,
+                },
+              ],
+            });
+            console.log(JSON.stringify({
+              userId: user.id,
+              token,
+              referenceImageUrl: uploaded.url,
+              seededConversationId: conversation.id,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          uat_json=$(printf '%s\n' "$uat_raw" | tail -n 1)
+          E2E_USER_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).userId)')
+          E2E_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).token)')
+          E2E_REFERENCE_IMAGE_URL=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).referenceImageUrl)')
+          E2E_SEEDED_CONVERSATION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).seededConversationId)')
+          for value in E2E_USER_ID E2E_TOKEN E2E_REFERENCE_IMAGE_URL E2E_SEEDED_CONVERSATION_ID; do
+            echo "::add-mask::${!value}"
+            echo "$value=${!value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Run desktop ordinary-image, business-card, and protocol UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          E2E_EVIDENCE_DIR: uat-artifacts
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/.github/e2e/production-miaoji-shared-flow.cjs
+
+      - name: Run mobile poster creation and reference-only edit UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          EVIDENCE_DIR: uat-artifacts
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/.github/e2e/production-image-edit.cjs
+
+      - name: Bind generated task IDs from browser evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          image_report=$(find uat-artifacts -maxdepth 1 -name 'production-image-edit-*.json' -print -quit)
+          test -n "$image_report"
+          E2E_ORDINARY_ID=$(node -e 'process.stdout.write(require("./uat-artifacts/miaoji-shared-flow-uat.json").ordinaryImage.generationId)')
+          E2E_CARD_ID=$(node -e 'process.stdout.write(require("./uat-artifacts/miaoji-shared-flow-uat.json").businessCard.generationId)')
+          E2E_FIRST_POSTER_ID=$(REPORT="$image_report" node -e 'process.stdout.write(require("./" + process.env.REPORT).firstGenerationId)')
+          E2E_EDITED_ID=$(REPORT="$image_report" node -e 'process.stdout.write(require("./" + process.env.REPORT).editedGenerationId)')
+          for value in E2E_ORDINARY_ID E2E_CARD_ID E2E_FIRST_POSTER_ID E2E_EDITED_ID; do
+            echo "::add-mask::${!value}"
+            echo "$value=${!value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Collect production task, tool, billing, and protocol evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_USER_ID='$E2E_USER_ID' E2E_SEEDED_CONVERSATION_ID='$E2E_SEEDED_CONVERSATION_ID' E2E_ORDINARY_ID='$E2E_ORDINARY_ID' E2E_CARD_ID='$E2E_CARD_ID' E2E_FIRST_POSTER_ID='$E2E_FIRST_POSTER_ID' E2E_EDITED_ID='$E2E_EDITED_ID' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const { classifyUnpricedUsage } = require('./dist/apps/api/apps/api/src/ai/unpriced-monitoring');
+          const prisma = new PrismaClient();
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const pseudonym = (value) => value ? crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16) : null;
+          const protocol = /<\s*[｜|]DSML[｜|]|DSML\s+to\s+course|failed\s+to\s+parse[^\n]*(?:tool[_ -]?calls?|DSML)|malformed\s+tool[- ]call|<\/?tool_calls?\b/iu;
+
+          (async () => {
+            const userId = process.env.E2E_USER_ID;
+            const ids = [process.env.E2E_ORDINARY_ID, process.env.E2E_CARD_ID, process.env.E2E_FIRST_POSTER_ID, process.env.E2E_EDITED_ID];
+            const incidentUsageIds = [
+              '4912844b-4be9-45ee-beb5-c20c898e5139',
+              '912cd4a6-0c5e-487e-b793-7fd658da12b3',
+              '67efdf6e-a26d-4e1f-9982-844232ebd506',
+              '59940fe7-ae47-4f36-9d8a-9d2edcb564e2',
+              '30026756-977e-4c46-a2c1-ad64306e5c3f',
+              'efae08fd-7274-4588-8c8a-034203cb7500',
+            ];
+            const [generations, usage, reservations, messages, packs, incidentUsage, incidentMismatches] = await Promise.all([
+              prisma.aiGeneration.findMany({ where: { id: { in: ids }, userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.tokenUsageLog.findMany({ where: { referenceId: { in: ids }, userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.creditReservation.findMany({ where: { referenceId: { in: ids }, userId }, orderBy: { createdAt: 'asc' } }),
+              prisma.aiMessage.findMany({ where: { conversation: { userId } }, include: { conversation: { select: { id: true } } }, orderBy: { createdAt: 'asc' } }),
+              prisma.tokenPack.findMany({ where: { userId } }),
+              prisma.tokenUsageLog.findMany({ where: { id: { in: incidentUsageIds } }, orderBy: { createdAt: 'asc' } }),
+              prisma.providerBillSample.count({ where: { usageLogId: { in: incidentUsageIds }, status: 'MISMATCH' } }),
+            ]);
+            assert(generations.length === 4, `Expected four real image tasks, got ${generations.length}`);
+            assert(generations.every((item) => item.status === 'COMPLETED' && item.imageUrl), 'Not every image task completed with an OSS URL');
+            assert(generations.every((item) => item.type === 'POSTER'), 'Physical compatibility type changed unexpectedly');
+            const byId = Object.fromEntries(generations.map((item) => [item.id, item]));
+            assert(byId[process.env.E2E_ORDINARY_ID]?.metadata?.contentKind === 'image', 'Ordinary image contentKind is incorrect');
+            assert(byId[process.env.E2E_CARD_ID]?.metadata?.contentKind === 'image_edit', 'Business-card contentKind is incorrect');
+            assert(byId[process.env.E2E_EDITED_ID]?.metadata?.contentKind === 'image_edit', 'Poster edit contentKind is incorrect');
+            assert(!JSON.stringify(byId[process.env.E2E_EDITED_ID]).includes(byId[process.env.E2E_FIRST_POSTER_ID]?.metadata?.title || '__no_title__'), 'Edited work retained the old title');
+
+            const toolResults = messages.flatMap((message) => Array.isArray(message.attachments?.toolResults) ? message.attachments.toolResults : []);
+            const generatedImages = toolResults.filter((item) => item.toolName === 'generate_image' && item.success);
+            assert(generatedImages.length === 2, `Expected two successful generate_image tool results, got ${generatedImages.length}`);
+            assert(!toolResults.some((item) => item.toolName === 'generate_poster'), 'Ordinary image or business card was routed to generate_poster');
+            const newAssistantMessages = messages.filter((message) => message.role === 'assistant' && message.conversation.id !== process.env.E2E_SEEDED_CONVERSATION_ID);
+            assert(!newAssistantMessages.some((message) => protocol.test(message.content)), 'A new assistant message persisted protocol text');
+
+            assert(reservations.length === 4, `Expected four reservations, got ${reservations.length}`);
+            assert(reservations.every((item) => item.status === 'SETTLED' && item.amount === 100 && item.pricingVersionId && item.pricingCapturedAt), 'Image reservation state or immutable pricing snapshot is incorrect');
+            assert(!reservations.some((item) => item.status === 'RESERVED'), 'An active image reservation remains');
+            for (const id of ids) {
+              const rows = usage.filter((item) => item.referenceId === id && item.businessType === 'IMAGE');
+              assert(rows.some((item) => item.tokensUsed === 100), `Image ${pseudonym(id)} has no 100-credit usage row`);
+            }
+            assert(packs.reduce((sum, pack) => sum + pack.usedTokens, 0) === 400, 'Four completed image tasks did not consume exactly 400 credits');
+
+            assert(incidentUsage.length === 6, `Expected the six preserved incident usage rows, got ${incidentUsage.length}`);
+            const incidentClassifications = incidentUsage.map((item) => classifyUnpricedUsage({
+              businessType: item.businessType,
+              provider: item.provider,
+              model: item.model,
+            }));
+            assert(incidentUsage.every((item) => item.costStatus === 'UNPRICED' && item.tokensUsed === 100), 'Incident usage credits or raw cost status changed');
+            assert(incidentUsage.every((item) => item.costOriginal === null && item.costUsd === null && item.costCny === null), 'An incident row acquired a fabricated provider cost');
+            assert(incidentClassifications.every((item) => item.category === 'PRICE_SOURCE_PENDING'), 'An incident row is still presented as an actionable mapping failure');
+            assert(incidentMismatches === 0, `Incident rows have ${incidentMismatches} provider sample mismatches`);
+
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              userHash: pseudonym(userId),
+              tasks: generations.map((item) => ({
+                idHash: pseudonym(item.id), status: item.status, style: item.style,
+                contentKind: item.metadata?.contentKind || 'poster', hasImageUrl: Boolean(item.imageUrl),
+              })),
+              tools: generatedImages.map((item) => ({ toolName: item.toolName, success: item.success, taskHash: pseudonym(item.data?.id) })),
+              reservations: reservations.map((item) => ({ referenceHash: pseudonym(item.referenceId), status: item.status, amount: item.amount, hasPricingSnapshot: Boolean(item.pricingCapturedAt) })),
+              usage: usage.filter((item) => ids.includes(item.referenceId)).map((item) => ({ referenceHash: pseudonym(item.referenceId), provider: item.provider, model: item.model, tokensUsed: item.tokensUsed, costStatus: item.costStatus })),
+              newProtocolLeakCount: newAssistantMessages.filter((message) => protocol.test(message.content)).length,
+              consumedCredits: packs.reduce((sum, pack) => sum + pack.usedTokens, 0),
+              originalUnpricedIncident: {
+                rowCount: incidentUsage.length,
+                totalCredits: incidentUsage.reduce((sum, item) => sum + item.tokensUsed, 0),
+                rawCostStatus: 'UNPRICED',
+                monitoringCategory: 'PRICE_SOURCE_PENDING',
+                providerMismatchCount: incidentMismatches,
+                identities: incidentUsage.map((item, index) => ({
+                  idHash: pseudonym(item.id),
+                  businessType: item.businessType,
+                  provider: item.provider,
+                  model: item.model,
+                  classification: incidentClassifications[index].category,
+                })),
+              },
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/server-ledger.json
+
+      - name: Remove scoped UAT account and OSS assets
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '{"cleanup":"skipped","reason":"no scoped prefix allocated"}\n' > uat-artifacts/cleanup-evidence.json
+            exit 0
+          fi
+          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const pseudonym = (value) => crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+          const collectStrings = (value, found = []) => {
+            if (typeof value === 'string') found.push(value);
+            else if (Array.isArray(value)) value.forEach((item) => collectStrings(item, found));
+            else if (value && typeof value === 'object') Object.values(value).forEach((item) => collectStrings(item, found));
+            return found;
+          };
+
+          (async () => {
+            const users = await prisma.user.findMany({ where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } } });
+            if (users.length > 5) throw new Error('Refusing to clean more than five scoped UAT users');
+            if (users.some((user) => !user.phone.startsWith(process.env.E2E_UAT_PREFIX))) throw new Error('Cleanup escaped its scoped prefix');
+            let deletedOssObjects = 0;
+            const removed = [];
+            for (const user of users) {
+              const [generations, messages] = await Promise.all([
+                prisma.aiGeneration.findMany({ where: { userId: user.id } }),
+                prisma.aiMessage.findMany({ where: { conversation: { userId: user.id } } }),
+              ]);
+              const active = generations.filter((item) => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status));
+              if (active.length) throw new Error(`Refusing cleanup with active tasks: ${active.map((item) => item.status).join(',')}`);
+              const urls = [
+                ...collectStrings(user.aiProfileData),
+                ...generations.flatMap((item) => collectStrings({ imageUrl: item.imageUrl, metadata: item.metadata })),
+                ...messages.flatMap((item) => collectStrings(item.attachments)),
+              ].filter((value) => /^https?:\/\//.test(value) || /^\/api\/files\//.test(value));
+              if (process.env.OSS_REGION && process.env.OSS_ACCESS_KEY_ID && process.env.OSS_ACCESS_KEY_SECRET && process.env.OSS_BUCKET) {
+                const OSS = require('ali-oss');
+                const client = new OSS({
+                  region: process.env.OSS_REGION,
+                  accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+                  accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+                  bucket: process.env.OSS_BUCKET,
+                  secure: true,
+                });
+                for (const value of [...new Set(urls)]) {
+                  let key;
+                  try { key = decodeURIComponent(new URL(value, 'https://zhiduoduoai.com').pathname).replace(/^\/api\/files\//, '').replace(/^\/+/, ''); }
+                  catch { continue; }
+                  if (!/^(chat|posters)\//.test(key)) continue;
+                  try { await client.delete(key); deletedOssObjects += 1; }
+                  catch (error) {
+                    if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
+                  }
+                }
+              }
+              await prisma.aiGeneration.updateMany({ where: { userId: user.id }, data: { relatedId: null } });
+              await prisma.aiChatAction.deleteMany({ where: { userId: user.id } });
+              await prisma.aiChatRequest.deleteMany({ where: { userId: user.id } });
+              await prisma.aiMessage.deleteMany({ where: { conversation: { userId: user.id } } });
+              await prisma.aiConversation.deleteMany({ where: { userId: user.id } });
+              await prisma.creditReservation.deleteMany({ where: { userId: user.id } });
+              await prisma.tokenUsageLog.deleteMany({ where: { userId: user.id } });
+              await prisma.dailyTokenUsage.deleteMany({ where: { userId: user.id } });
+              await prisma.aiGeneration.deleteMany({ where: { userId: user.id } });
+              await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
+              await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
+              await prisma.user.delete({ where: { id: user.id } });
+              removed.push(pseudonym(user.id));
+            }
+            const remaining = await prisma.user.count({ where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } } });
+            if (remaining) throw new Error(`Scoped UAT users remain: ${remaining}`);
+            console.log(JSON.stringify({ cleanupComplete: true, removedUserHashes: removed, deletedOssObjects }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/cleanup-evidence.json
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: miaoji-shared-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record production acceptance
+        if: success()
+        run: |
+          echo 'production_miaoji_shared_uat=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'
