@@ -134,8 +134,6 @@ jobs:
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
         run: |
           set -Eeuo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
           install -d -m 700 "$HOME/.ssh"
           if [ "$SERVER_PORT" = "22" ]; then
             KNOWN_HOST="$SERVER_HOST"
@@ -144,13 +142,25 @@ jobs:
           fi
           printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          sshpass -p "$SERVER_PASSWORD" scp \
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-deploy-askpass"
+          trap 'rm -f -- "$ASKPASS_SCRIPT"' EXIT
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          chmod 700 "$ASKPASS_SCRIPT"
+          export SSH_ASKPASS="$ASKPASS_SCRIPT"
+          export SSH_ASKPASS_REQUIRE=force
+          export DISPLAY=zhiduoduo-deploy:0
+          timeout 180s setsid --wait scp \
             -P "$SERVER_PORT" \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
             deploy.tar.gz \
-            "$SERVER_USER@$SERVER_HOST:/opt/apps/zhiduoduo-platform/deploy.tar.gz"
+            "$SERVER_USER@$SERVER_HOST:/opt/apps/zhiduoduo-platform/deploy.tar.gz" </dev/null
 
       - name: Deploy release with database backup, health, and stability acceptance
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
