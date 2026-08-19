@@ -1,0 +1,190 @@
+name: Verify Zhiduoduo Video Pipeline V2 Production
+run-name: "verify video-pipeline-v2 ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing the V2 UAT assertions
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-video-pipeline-v2-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Validate bound release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Checkout immutable source UAT assertions
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install production browser and SSH runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-v2-uat-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-v2-uat-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo "SSH_ASKPASS_REQUIRE=force"
+            echo "DISPLAY=zhiduoduo-v2-uat:0"
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Create isolated production UAT account
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="pipeline-v2-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          uat_json=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            < source/.github/e2e/production-video-pipeline-v2-setup.cjs)
+          E2E_ADMIN_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).userId)')
+          E2E_ADMIN_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).token)')
+          echo "::add-mask::$E2E_ADMIN_ID"
+          echo "::add-mask::$E2E_ADMIN_TOKEN"
+          {
+            echo "E2E_ADMIN_ID=$E2E_ADMIN_ID"
+            echo "E2E_ADMIN_TOKEN=$E2E_ADMIN_TOKEN"
+          } >> "$GITHUB_ENV"
+
+      - name: Run real multi-shot browser UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          E2E_EVIDENCE_DIR: uat-artifacts
+          NODE_PATH: ${{ github.workspace }}/node_modules
+        run: node source/.github/e2e/production-video-pipeline-v2.cjs
+
+      - name: Collect production pipeline, billing, quality, and timing ledger
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_V2_PRODUCTION_ID:-}" ] || [ -z "${E2E_V2_CANCEL_PRODUCTION_ID:-}" ]; then
+            printf '{"collection":"skipped","reason":"browser UAT did not reach both task IDs"}\n' > uat-artifacts/server-ledger.json
+            exit 0
+          fi
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$SOURCE_SHA' E2E_ADMIN_ID='$E2E_ADMIN_ID' E2E_V2_PRODUCTION_ID='$E2E_V2_PRODUCTION_ID' E2E_V2_CANCEL_PRODUCTION_ID='$E2E_V2_CANCEL_PRODUCTION_ID' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            < source/.github/e2e/production-video-pipeline-v2-ledger.cjs)
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/server-ledger.json
+
+      - name: Remove isolated account, tasks, and OSS objects
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '{"cleanup":"skipped","reason":"no UAT identity allocated"}\n' | tee uat-artifacts/cleanup-evidence.json
+            exit 0
+          fi
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            < source/.github/e2e/production-video-pipeline-v2-cleanup.cjs)
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/cleanup-evidence.json
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: video-pipeline-v2-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record activated production acceptance
+        if: success()
+        run: |
+          echo 'production_video_pipeline_v2_uat=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'verification_url=https://zhiduoduoai.com/video-production'
