@@ -138,16 +138,23 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p uat-artifacts
-          if [ -z "${E2E_V2_PRODUCTION_ID:-}" ] || [ -z "${E2E_V2_CANCEL_PRODUCTION_ID:-}" ]; then
-            printf '{"collection":"skipped","reason":"browser UAT did not reach both task IDs"}\n' > uat-artifacts/server-ledger.json
+          if [ -z "${E2E_V2_PRODUCTION_ID:-}" ]; then
+            printf '{"collection":"skipped","reason":"browser UAT did not create the main task"}\n' > uat-artifacts/server-ledger.json
             exit 0
           fi
           output=$("$E2E_SSH_WRAPPER" \
             -p "$SERVER_PORT" \
             "$SERVER_USER@$SERVER_HOST" \
-            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$SOURCE_SHA' E2E_ADMIN_ID='$E2E_ADMIN_ID' E2E_V2_PRODUCTION_ID='$E2E_V2_PRODUCTION_ID' E2E_V2_CANCEL_PRODUCTION_ID='$E2E_V2_CANCEL_PRODUCTION_ID' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$SOURCE_SHA' E2E_ADMIN_ID='$E2E_ADMIN_ID' E2E_V2_PRODUCTION_ID='$E2E_V2_PRODUCTION_ID' E2E_V2_CANCEL_PRODUCTION_ID='${E2E_V2_CANCEL_PRODUCTION_ID:-}' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
             < source/.github/e2e/production-video-pipeline-v2-ledger.cjs)
-          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/server-ledger.json
+          ledger=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$ledger" | tee uat-artifacts/server-ledger.json
+          if [ -n "${E2E_V2_CANCEL_PRODUCTION_ID:-}" ]; then
+            LEDGER_JSON="$ledger" node -e '
+              const ledger = JSON.parse(process.env.LEDGER_JSON);
+              if (!ledger.acceptance?.passed) throw new Error(`Server ledger acceptance failed: ${ledger.acceptance?.failures?.join(" | ")}`);
+            '
+          fi
 
       - name: Remove isolated account, tasks, and OSS objects
         if: always()
