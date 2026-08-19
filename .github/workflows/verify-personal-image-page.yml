@@ -1,0 +1,432 @@
+name: Verify Zhiduoduo Personal Image Page Production
+run-name: "verify personal-image ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing the UAT assertions
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-personal-image-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate bound release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+
+      - name: Checkout immutable source UAT assertions
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install production browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-package-lock --no-save playwright@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-persona-uat-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-persona-uat-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo "SSH_ASKPASS_REQUIRE=force"
+            echo "DISPLAY=zhiduoduo-persona-uat:0"
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Create scoped real roles and OSS-backed materials
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="persona-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          uat_raw=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+
+          function tokenFor(user) {
+            return jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '25m' },
+            );
+          }
+
+          async function jsonResponse(response, label) {
+            const body = await response.json();
+            if (!response.ok || (body.code !== undefined && body.code !== 0)) {
+              throw new Error(label + ' failed with ' + response.status + ': ' + JSON.stringify(body).slice(0, 500));
+            }
+            return body.data ?? body;
+          }
+
+          (async () => {
+            const health = await jsonResponse(await fetch(apiBase + '/health'), 'health');
+            assert(health.release === process.env.EXPECTED_RELEASE, 'Active release is ' + health.release);
+            const suffix = process.env.E2E_UAT_PREFIX + '-' + Date.now();
+            const admin = await prisma.user.create({
+              data: {
+                phone: suffix + '-admin',
+                email: suffix + '-admin@test.local',
+                passwordHash: 'disabled-production-persona-uat',
+                name: '个人形象生产验收管理员',
+                role: 'PLATFORM_ADMIN',
+                isActivated: true,
+                aiPersona: 'PRODUCT_OWNER',
+                aiOnboardingDone: true,
+              },
+            });
+            const normal = await prisma.user.create({
+              data: {
+                phone: suffix + '-normal',
+                email: suffix + '-normal@test.local',
+                passwordHash: 'disabled-production-persona-uat',
+                name: '个人形象空状态验收用户',
+                role: 'TERMINAL_USER',
+                isActivated: true,
+                aiPersona: 'PRODUCT_OWNER',
+                aiOnboardingDone: true,
+              },
+            });
+            const adminToken = tokenFor(admin);
+            const normalToken = tokenFor(normal);
+            const png = Buffer.from(
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZpWQAAAAASUVORK5CYII=',
+              'base64',
+            );
+            const form = new FormData();
+            form.append('file', new Blob([png], { type: 'image/png' }), 'persona-uat.png');
+            const uploaded = await jsonResponse(await fetch(apiBase + '/ai/chat/upload', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + adminToken },
+              body: form,
+            }), 'personal image upload');
+            assert(/^https:\/\//.test(uploaded.url) || /^\/api\/files\//.test(uploaded.url), 'Unexpected OSS URL');
+            await jsonResponse(await fetch(apiBase + '/ai/chat/profile', {
+              method: 'PUT',
+              headers: { authorization: 'Bearer ' + adminToken, 'content-type': 'application/json' },
+              body: JSON.stringify({
+                profileData: { portraitUrl: uploaded.url, portraitNote: '当前生产验收个人形象' },
+                persona: 'PRODUCT_OWNER',
+              }),
+            }), 'personal image profile update');
+            const historicalPersonalImage = await prisma.aiGeneration.create({
+              data: {
+                userId: admin.id,
+                type: 'PERSONAL_IMAGE',
+                prompt: '生产验收历史个人形象',
+                result: '历史个人形象',
+                imageUrl: uploaded.url,
+                metadata: { contentKind: 'personal_image', source: 'production-uat' },
+                status: 'COMPLETED',
+              },
+            });
+            const adminWork = await prisma.aiGeneration.create({
+              data: {
+                userId: admin.id,
+                type: 'POSTER',
+                prompt: '生产验收普通作品',
+                result: '不应出现在个人形象中的普通作品',
+                imageUrl: uploaded.url,
+                metadata: { title: '管理员普通作品', source: 'production-uat' },
+                status: 'COMPLETED',
+              },
+            });
+            const normalWork = await prisma.aiGeneration.create({
+              data: {
+                userId: normal.id,
+                type: 'POSTER',
+                prompt: '空形象账号历史作品',
+                result: '空形象账号保留的历史作品',
+                imageUrl: uploaded.url,
+                metadata: { title: '终端用户普通作品', source: 'production-uat' },
+                status: 'COMPLETED',
+              },
+            });
+            console.log(JSON.stringify({
+              adminId: admin.id,
+              normalId: normal.id,
+              adminToken,
+              normalToken,
+              imageUrl: uploaded.url,
+              fixtureIds: [historicalPersonalImage.id, adminWork.id, normalWork.id],
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          uat_json=$(printf '%s\n' "$uat_raw" | tail -n 1)
+          E2E_ADMIN_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).adminId)')
+          E2E_NORMAL_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).normalId)')
+          E2E_ADMIN_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).adminToken)')
+          E2E_NORMAL_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).normalToken)')
+          E2E_IMAGE_URL=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).imageUrl)')
+          E2E_FIXTURE_IDS=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).fixtureIds.join(","))')
+          for value in E2E_ADMIN_ID E2E_NORMAL_ID E2E_ADMIN_TOKEN E2E_NORMAL_TOKEN E2E_IMAGE_URL E2E_FIXTURE_IDS; do
+            echo "::add-mask::${!value}"
+            echo "$value=${!value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Run real-role desktop and mobile personal-image UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          E2E_EVIDENCE_DIR: uat-artifacts
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+          NODE_PATH: ${{ github.workspace }}/node_modules
+        run: node source/.github/e2e/production-personal-image-page.cjs
+
+      - name: Collect preserved personal-image and works evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          (async () => {
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } },
+              include: { aiGenerations: { orderBy: { createdAt: 'asc' } } },
+              orderBy: { role: 'asc' },
+            });
+            assert(users.length === 2, 'Expected two scoped UAT users, got ' + users.length);
+            const admin = users.find((user) => user.role === 'PLATFORM_ADMIN');
+            const normal = users.find((user) => user.role === 'TERMINAL_USER');
+            assert(admin && normal, 'Scoped UAT roles are incomplete');
+            assert(Boolean(admin.aiProfileData?.portraitUrl), 'Administrator primary personal image was removed');
+            assert(admin.aiGenerations.filter((item) => item.type === 'PERSONAL_IMAGE').length === 1, 'Historical personal image was changed');
+            assert(admin.aiGenerations.filter((item) => item.type === 'POSTER').length === 1, 'Administrator ordinary work was changed');
+            assert(normal.aiGenerations.filter((item) => item.type === 'PERSONAL_IMAGE').length === 0, 'Empty-state role acquired a personal image');
+            assert(normal.aiGenerations.filter((item) => item.type === 'POSTER').length === 1, 'Terminal-user ordinary work was changed');
+            assert(users.flatMap((user) => user.aiGenerations).every((item) => item.status === 'COMPLETED'), 'A fixture status changed');
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              users: users.map((user) => ({
+                userHash: hash(user.id),
+                role: user.role,
+                hasPrimaryPersonalImage: Boolean(user.aiProfileData?.portraitUrl),
+                generations: user.aiGenerations.map((item) => ({ idHash: hash(item.id), type: item.type, status: item.status })),
+              })),
+              historicalDataPreserved: true,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          mkdir -p uat-artifacts
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/server-preservation.json
+
+      - name: Remove only scoped UAT users and OSS object
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '{"cleanup":"skipped","reason":"no scoped prefix allocated"}\n' > uat-artifacts/cleanup-evidence.json
+            exit 0
+          fi
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+          const collectStrings = (value, found = []) => {
+            if (typeof value === 'string') found.push(value);
+            else if (Array.isArray(value)) value.forEach((item) => collectStrings(item, found));
+            else if (value && typeof value === 'object') Object.values(value).forEach((item) => collectStrings(item, found));
+            return found;
+          };
+          (async () => {
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } },
+              include: { aiGenerations: true },
+            });
+            if (users.length > 4) throw new Error('Refusing to clean more than four scoped UAT users');
+            if (users.some((user) => !user.phone.startsWith(process.env.E2E_UAT_PREFIX))) {
+              throw new Error('Cleanup escaped its scoped prefix');
+            }
+            const urls = [...new Set(users.flatMap((user) => [
+              ...collectStrings(user.aiProfileData),
+              ...user.aiGenerations.flatMap((item) => collectStrings({ imageUrl: item.imageUrl, metadata: item.metadata })),
+            ]).filter((value) => /^https?:\/\//.test(value) || /^\/api\/files\//.test(value)))];
+            const removed = [];
+            for (const user of users) {
+              await prisma.aiGeneration.updateMany({ where: { userId: user.id }, data: { relatedId: null } });
+              await prisma.aiChatAction.deleteMany({ where: { userId: user.id } });
+              await prisma.aiChatRequest.deleteMany({ where: { userId: user.id } });
+              await prisma.aiMessage.deleteMany({ where: { conversation: { userId: user.id } } });
+              await prisma.aiConversation.deleteMany({ where: { userId: user.id } });
+              await prisma.creditReservation.deleteMany({ where: { userId: user.id } });
+              await prisma.tokenUsageLog.deleteMany({ where: { userId: user.id } });
+              await prisma.dailyTokenUsage.deleteMany({ where: { userId: user.id } });
+              await prisma.aiGeneration.deleteMany({ where: { userId: user.id } });
+              await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
+              await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
+              await prisma.user.delete({ where: { id: user.id } });
+              removed.push(hash(user.id));
+            }
+            let deletedOssObjects = 0;
+            if (process.env.OSS_REGION && process.env.OSS_ACCESS_KEY_ID && process.env.OSS_ACCESS_KEY_SECRET && process.env.OSS_BUCKET) {
+              const OSS = require('ali-oss');
+              const client = new OSS({
+                region: process.env.OSS_REGION,
+                accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+                accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+                bucket: process.env.OSS_BUCKET,
+                secure: true,
+              });
+              for (const value of urls) {
+                let key;
+                try {
+                  key = decodeURIComponent(new URL(value, 'https://zhiduoduoai.com').pathname)
+                    .replace(/^\/api\/files\//, '')
+                    .replace(/^\/+/, '');
+                } catch {
+                  continue;
+                }
+                if (!/^chat\//.test(key)) continue;
+                try {
+                  await client.delete(key);
+                  deletedOssObjects += 1;
+                } catch (error) {
+                  if (error?.code !== 'NoSuchKey' && error?.status !== 404 && error?.statusCode !== 404) throw error;
+                }
+              }
+            }
+            const remaining = await prisma.user.count({ where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } } });
+            if (remaining) throw new Error('Scoped UAT users remain: ' + remaining);
+            console.log(JSON.stringify({
+              cleanupComplete: true,
+              removedUserHashes: removed,
+              deletedOssObjects,
+              scopedPrefixHash: hash(process.env.E2E_UAT_PREFIX),
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          printf '%s\n' "$output" | tail -n 1 | tee uat-artifacts/cleanup-evidence.json
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: personal-image-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record production acceptance
+        if: success()
+        run: |
+          echo 'production_personal_image_uat=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'
