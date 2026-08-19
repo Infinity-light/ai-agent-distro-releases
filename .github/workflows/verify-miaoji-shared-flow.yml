@@ -321,7 +321,11 @@ jobs:
               const rows = usage.filter((item) => item.referenceId === id && item.businessType === 'IMAGE');
               assert(rows.some((item) => item.tokensUsed === 100), `Image ${pseudonym(id)} has no 100-credit usage row`);
             }
-            assert(packs.reduce((sum, pack) => sum + pack.usedTokens, 0) === 400, 'Four completed image tasks did not consume exactly 400 credits');
+            const imageCredits = usage
+              .filter((item) => ids.includes(item.referenceId) && item.businessType === 'IMAGE')
+              .reduce((sum, item) => sum + item.tokensUsed, 0);
+            const accountCredits = packs.reduce((sum, pack) => sum + pack.usedTokens, 0);
+            assert(imageCredits === 400, `Four completed image tasks consumed ${imageCredits} credits instead of 400`);
 
             assert(incidentUsage.length === 6, `Expected the six preserved incident usage rows, got ${incidentUsage.length}`);
             const incidentClassifications = incidentUsage.map((item) => classifyUnpricedUsage({
@@ -345,7 +349,8 @@ jobs:
               reservations: reservations.map((item) => ({ referenceHash: pseudonym(item.referenceId), status: item.status, amount: item.amount, hasPricingSnapshot: Boolean(item.pricingCapturedAt) })),
               usage: usage.filter((item) => ids.includes(item.referenceId)).map((item) => ({ referenceHash: pseudonym(item.referenceId), provider: item.provider, model: item.model, tokensUsed: item.tokensUsed, costStatus: item.costStatus })),
               newProtocolLeakCount: newAssistantMessages.filter((message) => protocol.test(message.content)).length,
-              consumedCredits: packs.reduce((sum, pack) => sum + pack.usedTokens, 0),
+              imageCredits,
+              accountCreditsIncludingChat: accountCredits,
               originalUnpricedIncident: {
                 rowCount: incidentUsage.length,
                 totalCredits: incidentUsage.reduce((sum, item) => sum + item.tokensUsed, 0),
