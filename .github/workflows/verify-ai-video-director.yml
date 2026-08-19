@@ -219,7 +219,24 @@ jobs:
               },
             });
 
-            const model = 'doubao-seedance-2-0-mini-260615';
+            const modelDefinition = await prisma.aiModelDefinition.findFirst({
+              where: {
+                providerModelId: 'doubao-seedance-2-0-mini-260615',
+                modality: 'VIDEO',
+                enabled: true,
+                executable: true,
+                healthStatus: 'HEALTHY',
+                connection: { enabled: true, healthStatus: 'HEALTHY' },
+              },
+              select: { id: true, displayName: true, providerModelId: true, limits: true },
+            });
+            assert(modelDefinition?.id, 'Production UAT requires the enabled healthy Seedance Mini model definition');
+            const modelDefinitionId = modelDefinition.id;
+            const model = modelDefinition.providerModelId;
+            const modelName = modelDefinition.displayName;
+            const creditsPerSecond = Number(modelDefinition.limits?.billing?.creditsPerSecond);
+            const creditCost = Math.ceil(4 * creditsPerSecond);
+            assert(creditCost === 400, `Production UAT Seedance Mini price is ${creditCost}, expected 400 credits`);
             const pricingCapturedAt = new Date();
             const pricingVersion = await prisma.modelPricingVersion.findFirst({
               where: { effectiveAt: { lte: pricingCapturedAt } },
@@ -239,7 +256,8 @@ jobs:
             ];
             const makeArguments = (materialIds) => ({
               prompt: '以参考图中的白色咖啡杯为唯一产品主体，制作无人物、无文字、无商标的四秒竖屏产品短片。保持杯型、配色和桌面氛围连续一致。',
-              model,
+              modelDefinitionId,
+              containsRealPerson: false,
               duration: 4,
               ratio: '9:16',
               resolution: '720p',
@@ -250,13 +268,13 @@ jobs:
               shots,
               materialIds,
               confirmedByUser: true,
-              confirmedCreditCost: 400,
+              confirmedCreditCost: creditCost,
               ...pricingSnapshot,
             });
             const quote = (title, materialIds, args) => ({
               type: 'video_quote', mode: 'single', title,
-              model, modelName: 'Seedance 2.0 Mini', ratio: '9:16', resolution: '720p',
-              durations: [4], totalDuration: 4, segmentCredits: [400], totalCreditCost: 400, materialIds,
+              model: modelDefinitionId, modelDefinitionId, modelName, ratio: '9:16', resolution: '720p',
+              durations: [4], totalDuration: 4, segmentCredits: [creditCost], totalCreditCost: creditCost, materialIds,
               ...pricingSnapshot,
               confirmation: { toolName: 'generate_video', arguments: args },
             });
@@ -278,7 +296,7 @@ jobs:
                   confirmation: quoteData.confirmation,
                   quote: {
                     type: quoteData.type, mode: quoteData.mode, title: quoteData.title,
-                    model: quoteData.model, modelName: quoteData.modelName,
+                    model: quoteData.model, modelDefinitionId: quoteData.modelDefinitionId, modelName: quoteData.modelName,
                     ratio: quoteData.ratio, resolution: quoteData.resolution,
                     durations: quoteData.durations, totalDuration: quoteData.totalDuration,
                     segmentCredits: quoteData.segmentCredits, totalCreditCost: quoteData.totalCreditCost,
@@ -353,11 +371,14 @@ jobs:
                 type: 'VIDEO',
                 prompt: '生产验收失败任务',
                 result: '视频生成失败',
-                style: 'doubao-seedance-2-0-mini-260615',
+                style: modelName,
+                modelDefinitionId,
                 status: 'FAILED',
                 errorMessage: '生产验收：上游明确返回失败，可安全重试',
                 metadata: {
-                  model: 'doubao-seedance-2-0-mini-260615',
+                  model,
+                  modelDisplayName: modelName,
+                  modelDefinitionId,
                   duration: 4,
                   ratio: '9:16',
                   resolution: '720p',
@@ -373,7 +394,7 @@ jobs:
                     { startSeconds: 3, endSeconds: 4, purpose: '收束', visual: '咖啡杯停在干净暖色桌面中央' },
                   ],
                   materials: [],
-                  creditCost: 400,
+                  creditCost,
                   billingMode: 'credits',
                   pricingMode: 'withoutVideoInput',
                   providerStatus: 'failed',
