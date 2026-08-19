@@ -61,9 +61,31 @@ jobs:
         run: |
           set -Eeuo pipefail
           npm install --no-package-lock --no-save playwright@1.55.1
-          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install --with-deps chromium
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" npx playwright install chromium
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-uat-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-uat-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo "SSH_ASKPASS_REQUIRE=force"
+            echo "DISPLAY=zhiduoduo-uat:0"
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
 
       - name: Create isolated real accounts and OSS-backed materials
         shell: bash
@@ -81,11 +103,8 @@ jobs:
           if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
           printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          uat_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+          uat_json=$("$E2E_SSH_WRAPPER" \
             -p "$SERVER_PORT" \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
             "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
           set -Eeuo pipefail
@@ -459,11 +478,8 @@ jobs:
             printf '{"collection":"skipped","reason":"browser UAT did not reach both task IDs"}\n' > uat-artifacts/server-ledger.json
             exit 0
           fi
-          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+          output=$("$E2E_SSH_WRAPPER" \
             -p "$SERVER_PORT" \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
             "EXPECTED_RELEASE='$SOURCE_SHA' E2E_ADMIN_ID='$E2E_ADMIN_ID' E2E_WORK_ID='$E2E_WORK_ID' E2E_FAILED_VIDEO_ID='$E2E_FAILED_VIDEO_ID' E2E_SUCCESS_GENERATION_ID='$E2E_SUCCESS_GENERATION_ID' E2E_RETRY_GENERATION_ID='$E2E_RETRY_GENERATION_ID' E2E_CHOICE_ACTION_ID='$E2E_CHOICE_ACTION_ID' E2E_CANCEL_ACTION_ID='$E2E_CANCEL_ACTION_ID' E2E_DENIAL_ACTION_ID='$E2E_DENIAL_ACTION_ID' E2E_SUCCESS_ACTION_ID='$E2E_SUCCESS_ACTION_ID' bash -se" <<'REMOTE'
           set -Eeuo pipefail
@@ -663,11 +679,8 @@ jobs:
             printf '{"cleanup":"skipped","reason":"no UAT identity allocated"}\n' | tee uat-artifacts/cleanup-evidence.json
             exit 0
           fi
-          output=$(sshpass -p "$SERVER_PASSWORD" ssh \
+          output=$("$E2E_SSH_WRAPPER" \
             -p "$SERVER_PORT" \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
             "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' bash -se" <<'REMOTE'
           set -Eeuo pipefail
