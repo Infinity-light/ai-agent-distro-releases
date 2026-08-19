@@ -111,6 +111,14 @@ function safeVideoReference(value) {
     await page.screenshot({ path: path.join(evidenceDir, '01-provider-rejection-zero-charge.png'), fullPage: true });
     const afterFailure = await balance(context);
     assert(afterFailure.remaining === before.remaining, `Rejected request changed balance ${before.remaining} -> ${afterFailure.remaining}`);
+    const expectedRejectedRequestConsoleError = new RegExp(
+      `Failed to load resource:.*status of ${failureResponse.status()}`,
+    );
+    assert(
+      consoleErrors.every(message => expectedRejectedRequestConsoleError.test(message)),
+      `Unexpected console errors during the deliberate provider rejection: ${consoleErrors.join(' | ')}`,
+    );
+    consoleErrors.length = 0;
 
     // Start a fresh text-only 4-second task through the same production UI.
     await page.reload({ waitUntil: 'networkidle', timeout: 45_000 });

@@ -150,9 +150,11 @@ jobs:
           test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
           cd "$ACTIVE_RELEASE"
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { createHash } = require('node:crypto');
           const { PrismaClient } = require('@prisma/client');
           const prisma = new PrismaClient();
           const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const pseudonym = value => value ? createHash('sha256').update(String(value)).digest('hex').slice(0, 12) : null;
           (async () => {
             const user = await prisma.user.findUnique({ where: { phone: process.env.UAT_PHONE } });
             assert(user, 'UAT account not found');
@@ -177,7 +179,9 @@ jobs:
             assert(failedMeta.providerFailure?.clientRequestId, 'Rejected task has no outbound request ID');
             assert(failedMeta.providerFailure?.originalMessage, 'Rejected task has no provider raw error evidence');
             assert(!usages.some(item => item.referenceId === failed.id), 'Rejected task has a usage charge');
-            assert(!reservations.some(item => item.referenceId === failed.id), 'Rejected task has a credit reservation');
+            const failedReservation = reservations.find(item => item.referenceId === failed.id);
+            assert(failedReservation?.status === 'RELEASED', `Rejected task reservation is ${failedReservation?.status}`);
+            assert(failedReservation.releasedAt && !failedReservation.settledAt, 'Rejected task reservation timestamps are invalid');
 
             assert(completed?.status === 'COMPLETED', `Successful task status is ${completed?.status}`);
             assert(completed.providerTaskId, 'Successful task has no provider task ID');
@@ -189,30 +193,36 @@ jobs:
             assert(completedUsage[0].tokensUsed === 400, `Expected 400 charged credits, got ${completedUsage[0].tokensUsed}`);
             assert(completedUsage[0].businessType === 'VIDEO', `Usage business type is ${completedUsage[0].businessType}`);
             assert(completedUsage[0].costStatus === 'PRICED', `Usage cost status is ${completedUsage[0].costStatus}`);
-            assert(reservations.length === 0, `Short-video UAT left ${reservations.length} reservations`);
+            const completedReservation = reservations.find(item => item.referenceId === completed.id);
+            assert(completedReservation?.status === 'SETTLED', `Successful task reservation is ${completedReservation?.status}`);
+            assert(completedReservation.settledAt && !completedReservation.releasedAt, 'Successful task reservation timestamps are invalid');
+            assert(!reservations.some(item => item.status === 'RESERVED'), 'Short-video UAT left an active reservation');
+            assert(reservations.length === 2, `Expected two immutable reservation audit rows, got ${reservations.length}`);
             assert(packs.length === 1 && packs[0].usedTokens === 400, `Token pack usage is ${packs.map(item => item.usedTokens).join(',')}`);
 
             console.log(JSON.stringify({
               release: process.env.EXPECTED_RELEASE,
-              userId: user.id,
+              userRef: pseudonym(user.id),
               failed: {
-                generationId: failed.id,
+                generationRef: pseudonym(failed.id),
                 status: failed.status,
-                providerTaskId: failed.providerTaskId,
-                inboundRequestId: failedMeta.inboundRequestId,
-                providerFailure: failedMeta.providerFailure,
+                providerTaskRef: pseudonym(failed.providerTaskId),
+                inboundRequestRef: pseudonym(failedMeta.inboundRequestId),
+                outboundRequestRef: pseudonym(failedMeta.providerFailure.clientRequestId),
+                hasProviderErrorEvidence: Boolean(failedMeta.providerFailure.originalMessage),
                 chargedCredits: 0,
-                reservationCount: 0,
+                reservationStatus: failedReservation.status,
               },
               completed: {
-                generationId: completed.id,
+                generationRef: pseudonym(completed.id),
                 status: completed.status,
-                providerTaskId: completed.providerTaskId,
-                inboundRequestId: completedMeta.inboundRequestId,
-                providerSubmission: completedMeta.providerSubmission,
+                providerTaskRef: pseudonym(completed.providerTaskId),
+                inboundRequestRef: pseudonym(completedMeta.inboundRequestId),
+                outboundRequestRef: pseudonym(completedMeta.providerSubmission.clientRequestId),
                 chargedCredits: completedUsage[0].tokensUsed,
                 costStatus: completedUsage[0].costStatus,
-                pricingVersionId: completedUsage[0].pricingVersionId,
+                pricingVersionRef: pseudonym(completedUsage[0].pricingVersionId),
+                reservationStatus: completedReservation.status,
               },
             }));
           })().finally(() => prisma.$disconnect());
@@ -246,11 +256,13 @@ jobs:
           test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
           cd "$ACTIVE_RELEASE"
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { createHash } = require('node:crypto');
           const { PrismaClient } = require('@prisma/client');
           const jwt = require('jsonwebtoken');
           const prisma = new PrismaClient();
           const apiBase = 'http://127.0.0.1:3100/api';
           const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const pseudonym = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
           async function deleteOssObjects(generations) {
             if (!process.env.OSS_REGION || !process.env.OSS_ACCESS_KEY_ID || !process.env.OSS_ACCESS_KEY_SECRET || !process.env.OSS_BUCKET) return 0;
             const OSS = require('ali-oss');
@@ -279,7 +291,7 @@ jobs:
           (async () => {
             const user = await prisma.user.findUnique({ where: { phone: process.env.UAT_PHONE } });
             if (!user) {
-              console.log(JSON.stringify({ userAlreadyAbsent: true, phone: process.env.UAT_PHONE }));
+              console.log(JSON.stringify({ userAlreadyAbsent: true }));
               return;
             }
             const token = jwt.sign(
@@ -299,7 +311,7 @@ jobs:
               await sleep(5000);
             }
             const active = generations.filter(item => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status));
-            if (active.length) throw new Error(`Refusing cleanup while tasks are active: ${active.map(item => `${item.id}:${item.status}`).join(',')}`);
+            if (active.length) throw new Error(`Refusing cleanup while tasks are active: ${active.map(item => `${pseudonym(item.id)}:${item.status}`).join(',')}`);
             const deletedOssObjects = await deleteOssObjects(generations);
             const conversations = await prisma.aiConversation.findMany({ where: { userId: user.id }, select: { id: true } });
             const conversationIds = conversations.map(item => item.id);
@@ -317,7 +329,7 @@ jobs:
             await prisma.tokenPack.deleteMany({ where: { userId: user.id } });
             await prisma.businessProfile.deleteMany({ where: { userId: user.id } });
             await prisma.user.delete({ where: { id: user.id } });
-            console.log(JSON.stringify({ userId: user.id, deletedGenerations: generations.length, deletedOssObjects, accountDeleted: true }));
+            console.log(JSON.stringify({ userRef: pseudonym(user.id), deletedGenerations: generations.length, deletedOssObjects, accountDeleted: true }));
           })().finally(() => prisma.$disconnect());
           NODE
           REMOTE
