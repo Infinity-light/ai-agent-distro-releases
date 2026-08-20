@@ -1,0 +1,217 @@
+name: Audit MiniMax H3 and JKLLM Production State
+run-name: "audit minimax-h3-jkllm ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run ID
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate bound production release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to source SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install pinned SSH runtime
+        shell: bash
+        env:
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-provider-audit-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-provider-audit-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 180s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-provider-audit:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Collect read-only normalized registry and TCP evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p audit-artifacts "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          EXPECTED_RELEASE="$EXPECTED_RELEASE" node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const dns = require('node:dns').promises;
+          const net = require('node:net');
+          const prisma = new PrismaClient();
+
+          const hostOf = value => { try { return new URL(String(value)).host; } catch { return null; } };
+          const safeCode = value => String(value || '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 80) || null;
+          const tcp443 = host => new Promise(resolve => {
+            const started = Date.now();
+            const socket = net.connect({ host, port: 443 });
+            let done = false;
+            const finish = (status, code = null) => {
+              if (done) return;
+              done = true;
+              socket.destroy();
+              resolve({ status, code: safeCode(code), latencyMs: Date.now() - started });
+            };
+            socket.setTimeout(10_500, () => finish('TIMEOUT'));
+            socket.once('connect', () => finish('CONNECTED'));
+            socket.once('error', error => finish('ERROR', error.code || error.name));
+          });
+
+          (async () => {
+            const [connections, models, addresses] = await Promise.all([
+              prisma.aiModelConnection.findMany({
+                where: { OR: [{ adapter: 'minimax-h3-video' }, { endpoint: { contains: 'jkllm.top', mode: 'insensitive' } }] },
+                select: {
+                  endpoint: true, adapter: true, enabled: true, healthStatus: true, lastErrorCode: true,
+                  secretRef: true, secretCiphertext: true,
+                },
+              }),
+              prisma.aiModelDefinition.findMany({
+                where: { providerModelId: 'MiniMax-H3' },
+                select: {
+                  providerModelId: true, enabled: true, executable: true, healthStatus: true,
+                  supportsRealPerson: true, requiresIdentityAuth: true, limits: true,
+                  connection: { select: { adapter: true, enabled: true, healthStatus: true } },
+                },
+              }),
+              dns.lookup('jkllm.top', { all: true }).catch(() => []),
+            ]);
+            const tcpAttempts = [];
+            for (let index = 0; index < 3; index += 1) tcpAttempts.push(await tcp443('jkllm.top'));
+            const connectionView = item => ({
+              host: hostOf(item.endpoint),
+              adapter: item.adapter,
+              enabled: item.enabled,
+              healthStatus: item.healthStatus,
+              lastErrorCode: safeCode(item.lastErrorCode),
+              credentialConfigured: Boolean(item.secretRef || item.secretCiphertext),
+            });
+            const h3Models = models.map(item => {
+              const limits = item.limits && typeof item.limits === 'object' && !Array.isArray(item.limits) ? item.limits : {};
+              const verification = limits.productionVerification && typeof limits.productionVerification === 'object'
+                && !Array.isArray(limits.productionVerification) ? limits.productionVerification : {};
+              return {
+                providerModelId: item.providerModelId,
+                enabled: item.enabled,
+                executable: item.executable,
+                healthStatus: item.healthStatus,
+                supportsRealPerson: item.supportsRealPerson,
+                requiresIdentityAuth: item.requiresIdentityAuth,
+                connection: item.connection,
+                productionVerification: {
+                  status: safeCode(verification.status) || 'NOT_STARTED',
+                  errorCode: safeCode(verification.errorCode),
+                  hasTaskIdHash: /^[a-f0-9]{64}$/.test(String(verification.taskIdHash || '')),
+                  hasResultSha256: /^[a-f0-9]{64}$/.test(String(verification.resultSha256 || '')),
+                  resultBytes: Number.isFinite(Number(verification.resultBytes)) ? Number(verification.resultBytes) : null,
+                },
+              };
+            });
+            const evidence = {
+              release: process.env.EXPECTED_RELEASE,
+              minimaxEnvCredentialConfigured: Boolean(process.env.MODEL_PROVIDER_MINIMAX_API_KEY),
+              h3Connections: connections.filter(item => item.adapter === 'minimax-h3-video').map(connectionView),
+              h3Models,
+              jkllm: {
+                addresses: addresses.map(item => item.address),
+                connections: connections.filter(item => hostOf(item.endpoint) === 'jkllm.top').map(connectionView),
+                tcp443: tcpAttempts,
+              },
+            };
+            console.log(JSON.stringify(evidence));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          )
+          evidence=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$evidence" | tee audit-artifacts/provider-state.json
+          EVIDENCE_JSON="$evidence" node - <<'NODE'
+          const evidence = JSON.parse(process.env.EVIDENCE_JSON);
+          if (evidence.release !== process.env.SOURCE_SHA) throw new Error('Evidence release mismatch');
+          if (!evidence.minimaxEnvCredentialConfigured) throw new Error('MiniMax environment credential was not loaded');
+          if (evidence.h3Connections.length !== 1 || !evidence.h3Connections[0].credentialConfigured) throw new Error('MiniMax H3 normalized connection is missing its credential');
+          if (evidence.h3Models.length !== 1 || evidence.h3Models[0].providerModelId !== 'MiniMax-H3') throw new Error('Official MiniMax H3 model definition is missing');
+          if (evidence.h3Models[0].enabled || !evidence.h3Models[0].executable || !evidence.h3Models[0].supportsRealPerson) throw new Error('MiniMax H3 readiness gate is inconsistent');
+          if (evidence.h3Models[0].productionVerification.hasResultSha256) throw new Error('MiniMax H3 unexpectedly has successful production proof');
+          if (!evidence.jkllm.connections.length || !evidence.jkllm.connections.every(item => item.credentialConfigured)) throw new Error('JKLLM normalized connection or credential bridge is missing');
+          NODE
+
+      - name: Upload provider audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: minimax-h3-jkllm-production-state-${{ inputs.source_sha }}
+          path: audit-artifacts/provider-state.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record read-only provider audit
+        if: success()
+        run: |
+          echo 'provider_state_audit=passed'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
