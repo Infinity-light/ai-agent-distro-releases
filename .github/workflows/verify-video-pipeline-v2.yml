@@ -27,7 +27,10 @@ permissions:
   actions: read
 
 concurrency:
-  group: zhiduoduo-video-pipeline-v2-production-uat
+  # Share the deployment lock: a rolling restart between real generation and
+  # cancellation invalidates the bound-SHA evidence and can strand in-memory
+  # image jobs until stale recovery runs.
+  group: zhiduoduo-production
   cancel-in-progress: false
 
 jobs:
