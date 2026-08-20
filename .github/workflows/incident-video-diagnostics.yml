@@ -62,7 +62,7 @@ jobs:
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
           const { PrismaClient } = require('@prisma/client');
           const crypto = require('node:crypto');
-          const { execFileSync } = require('node:child_process');
+          const { execFileSync, spawnSync } = require('node:child_process');
           const fs = require('node:fs');
           const os = require('node:os');
           const path = require('node:path');
@@ -105,20 +105,27 @@ jobs:
             const files = ['zhiduoduo-platform-error.log', 'zhiduoduo-platform-out.log'];
             const sources = files.map((name) => ({ source: name, body: readTail(path.join(logDir, name)) }));
             try {
+              const processes = JSON.parse(execFileSync('pm2', ['jlist'], {
+                encoding: 'utf8',
+                maxBuffer: 4 * 1024 * 1024,
+              }));
+              const app = processes.find((item) => item?.name === 'zhiduoduo-platform');
+              const resolved = [app?.pm2_env?.pm_out_log_path, app?.pm2_env?.pm_err_log_path]
+                .filter((item) => typeof item === 'string' && item.length > 0);
+              for (const file of new Set(resolved)) {
+                sources.push({ source: `pm2-file:${path.basename(file)}`, body: readTail(file) });
+              }
+            } catch {}
+            try {
+              const output = spawnSync('pm2', ['logs', 'zhiduoduo-platform', '--lines', '1200', '--nostream', '--raw'], {
+                encoding: 'utf8',
+                maxBuffer: 8 * 1024 * 1024,
+              });
               sources.push({
                 source: 'pm2:zhiduoduo-platform',
-                body: execFileSync('pm2', ['logs', 'zhiduoduo-platform', '--lines', '1200', '--nostream', '--raw'], {
-                  encoding: 'utf8',
-                  maxBuffer: 8 * 1024 * 1024,
-                  stdio: ['ignore', 'pipe', 'pipe'],
-                }),
+                body: `${output.stdout || ''}\n${output.stderr || ''}`,
               });
-            } catch (error) {
-              sources.push({
-                source: 'pm2:zhiduoduo-platform',
-                body: `${error?.stdout || ''}\n${error?.stderr || ''}`,
-              });
-            }
+            } catch {}
             return sources.flatMap(({ source, body }) => {
               const lines = String(body || '').split(/\r?\n/);
               const selected = new Set();
