@@ -1,0 +1,280 @@
+name: Verify MiniMax H3 Enablement Gate Production
+run-name: "verify minimax-h3 enablement gate ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run ID
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate bound production release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to source SHA");
+          '
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install pinned SSH runtime
+        shell: bash
+        env:
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-h3-gate-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-h3-gate-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 360s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-h3-gate:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Exercise the application-owned H3 verification gate
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p verification-artifacts "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' UAT_RUN_ID='$GITHUB_RUN_ID' UAT_RUN_ATTEMPT='$GITHUB_RUN_ATTEMPT' bash -se" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          EXPECTED_RELEASE="$EXPECTED_RELEASE" UAT_RUN_ID="$UAT_RUN_ID" UAT_RUN_ATTEMPT="$UAT_RUN_ATTEMPT" \
+            node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          const apiBase = 'http://127.0.0.1:3100/api';
+
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+          const safeCode = value => String(value || '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 80) || null;
+          const isHash = value => /^[a-f0-9]{64}$/.test(String(value || ''));
+          const suffix = `${process.env.UAT_RUN_ID}-${process.env.UAT_RUN_ATTEMPT}`;
+          const phone = `minimax-h3-gate-uat-${suffix}`;
+          let cleanupComplete = false;
+
+          (async () => {
+            assert(/^[0-9a-f]{40}$/.test(process.env.EXPECTED_RELEASE || ''), 'Expected release is invalid');
+            assert(process.env.JWT_SECRET, 'JWT secret is unavailable');
+            const healthResponse = await fetch(`${apiBase}/health`);
+            const healthBody = await healthResponse.json();
+            const health = healthBody.data ?? healthBody;
+            assert(healthResponse.ok && health.status === 'ok', 'Production API is unhealthy');
+            assert(health.release === process.env.EXPECTED_RELEASE, 'Production API release mismatch');
+
+            const user = await prisma.user.create({
+              data: {
+                phone,
+                email: `${phone}@test.local`,
+                passwordHash: 'disabled-minimax-h3-production-gate-uat',
+                name: 'MiniMax H3 production gate UAT',
+                role: 'PLATFORM_ADMIN',
+                isActivated: true,
+                aiOnboardingDone: true,
+              },
+            });
+            const token = jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '10m' },
+            );
+            const headers = {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'X-Request-Id': `h3-gate-${suffix}`,
+            };
+
+            const models = await prisma.aiModelDefinition.findMany({
+              where: { providerModelId: 'MiniMax-H3' },
+              include: { connection: true },
+            });
+            assert(models.length === 1, 'Expected exactly one official MiniMax H3 model');
+            const before = models[0];
+            assert(before.enabled === false && before.executable === true, 'H3 pre-verification state is unsafe');
+            assert(before.connection.adapter === 'minimax-h3-video', 'H3 adapter mismatch');
+            assert(before.connection.enabled === true && before.connection.healthStatus === 'HEALTHY', 'H3 connection is not ready');
+            assert(Boolean(before.connection.secretRef || before.connection.secretCiphertext), 'H3 credential is not configured');
+
+            const optionsBeforeResponse = await fetch(`${apiBase}/ai/generate/video/options`, { headers });
+            const optionsBeforeBody = await optionsBeforeResponse.json();
+            const optionsBefore = object(optionsBeforeBody.data).models || [];
+            assert(optionsBeforeResponse.ok && Array.isArray(optionsBefore), 'Unable to read video options before verification');
+            assert(!optionsBefore.some(item => item && item.id === before.id), 'Unverified H3 is user-selectable before verification');
+
+            const response = await fetch(`${apiBase}/model-management/models/${encodeURIComponent(before.id)}/video-verification`, {
+              method: 'POST',
+              headers,
+              body: '{}',
+              signal: AbortSignal.timeout(120_000),
+            });
+            const responseBody = await response.json();
+            assert(response.status === 502, `Expected application HTTP 502, received ${response.status}`);
+            assert(responseBody.code === 'MINIMAX_H3_BALANCE_REQUIRED', `Unexpected application code ${safeCode(responseBody.code)}`);
+
+            const after = await prisma.aiModelDefinition.findUnique({
+              where: { id: before.id },
+              include: { connection: true },
+            });
+            assert(after, 'H3 model disappeared after verification');
+            const verification = object(object(after.limits).productionVerification);
+            assert(after.enabled === false && after.executable === true, 'Failed H3 verification did not preserve the enablement gate');
+            assert(after.connection.enabled === true && after.connection.healthStatus === 'HEALTHY', 'Failed generation was misclassified as a connection failure');
+            assert(verification.status === 'FAILED', 'H3 verification status is not FAILED');
+            assert(verification.errorCode === 'MINIMAX_H3_BALANCE_REQUIRED', 'H3 verification failure code mismatch');
+            assert(isHash(verification.requestIdHash), 'Provider request ID was not stored as a hash');
+            assert(!verification.taskId && !verification.resultSha256, 'Rejected H3 request unexpectedly retained task or result data');
+
+            const audit = await prisma.aiModelAudit.findFirst({
+              where: { modelId: before.id, action: 'H3_PRODUCTION_VERIFY_REJECTED' },
+              orderBy: { createdAt: 'desc' },
+            });
+            assert(audit, 'H3 verification rejection audit is missing');
+            const auditDetails = object(audit.details);
+            assert(Number(auditDetails.httpStatus) === 402, 'Provider HTTP status was not audited as 402');
+            assert(isHash(auditDetails.requestIdHash), 'Audit request ID was not hashed');
+
+            const optionsAfterResponse = await fetch(`${apiBase}/ai/generate/video/options`, { headers });
+            const optionsAfterBody = await optionsAfterResponse.json();
+            const optionsAfter = object(optionsAfterBody.data).models || [];
+            assert(optionsAfterResponse.ok && Array.isArray(optionsAfter), 'Unable to read video options after verification');
+            const h3UserSelectable = optionsAfter.some(item => item && item.id === before.id);
+            assert(!h3UserSelectable, 'Balance-rejected H3 is user-selectable');
+
+            const evidence = {
+              release: process.env.EXPECTED_RELEASE,
+              application: {
+                httpStatus: response.status,
+                code: safeCode(responseBody.code),
+              },
+              model: {
+                providerModelId: after.providerModelId,
+                enabled: after.enabled,
+                executable: after.executable,
+                supportsRealPerson: after.supportsRealPerson,
+                userSelectable: h3UserSelectable,
+              },
+              connection: {
+                adapter: after.connection.adapter,
+                enabled: after.connection.enabled,
+                healthStatus: after.connection.healthStatus,
+                credentialConfigured: Boolean(after.connection.secretRef || after.connection.secretCiphertext),
+              },
+              productionVerification: {
+                status: safeCode(verification.status),
+                errorCode: safeCode(verification.errorCode),
+                hasRequestIdHash: isHash(verification.requestIdHash),
+                hasTask: Boolean(verification.taskId),
+                hasResult: Boolean(verification.resultSha256),
+              },
+              audit: {
+                action: audit.action,
+                httpStatus: Number(auditDetails.httpStatus),
+                providerCode: safeCode(auditDetails.providerCode),
+                failureCode: safeCode(auditDetails.failureCode),
+                hasRequestIdHash: isHash(auditDetails.requestIdHash),
+              },
+              cleanupComplete: false,
+            };
+            return evidence;
+          })().then(async evidence => {
+            await prisma.user.deleteMany({ where: { phone } });
+            cleanupComplete = true;
+            console.log(JSON.stringify({ ...evidence, cleanupComplete }));
+          }).finally(async () => {
+            if (!cleanupComplete) await prisma.user.deleteMany({ where: { phone } }).catch(() => undefined);
+            await prisma.$disconnect();
+          });
+          NODE
+          REMOTE
+          )
+          evidence=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$evidence" | tee verification-artifacts/minimax-h3-enablement-gate.json
+          EVIDENCE_JSON="$evidence" node - <<'NODE'
+          const evidence = JSON.parse(process.env.EVIDENCE_JSON);
+          if (evidence.release !== process.env.SOURCE_SHA) throw new Error('Evidence release mismatch');
+          if (evidence.application.httpStatus !== 502 || evidence.application.code !== 'MINIMAX_H3_BALANCE_REQUIRED') throw new Error('Application failure mapping mismatch');
+          if (evidence.model.enabled || evidence.model.userSelectable || !evidence.model.executable || !evidence.model.supportsRealPerson) throw new Error('H3 enablement gate is inconsistent');
+          if (evidence.connection.healthStatus !== 'HEALTHY' || !evidence.connection.credentialConfigured) throw new Error('H3 connection was incorrectly degraded');
+          if (evidence.productionVerification.status !== 'FAILED' || evidence.productionVerification.errorCode !== 'MINIMAX_H3_BALANCE_REQUIRED') throw new Error('H3 verification state mismatch');
+          if (!evidence.productionVerification.hasRequestIdHash || evidence.productionVerification.hasTask || evidence.productionVerification.hasResult) throw new Error('H3 verification proof sanitization mismatch');
+          if (evidence.audit.action !== 'H3_PRODUCTION_VERIFY_REJECTED' || evidence.audit.httpStatus !== 402 || !evidence.audit.hasRequestIdHash) throw new Error('H3 rejection audit mismatch');
+          if (!evidence.cleanupComplete) throw new Error('Temporary administrator cleanup failed');
+          NODE
+
+      - name: Upload H3 enablement-gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: minimax-h3-enablement-gate-${{ inputs.source_sha }}
+          path: verification-artifacts/minimax-h3-enablement-gate.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record production H3 enablement decision
+        if: success()
+        run: |
+          echo 'minimax_h3_enablement_gate=balance_required'
+          echo 'h3_enabled=false'
+          echo 'h3_user_selectable=false'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
