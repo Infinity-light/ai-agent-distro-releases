@@ -1,0 +1,163 @@
+name: Recover Zhiduoduo Video Pipeline V2 UAT Cleanup
+run-name: "recover video-pipeline-v2 cleanup run=${{ inputs.uat_run_id }} attempt=${{ inputs.uat_attempt }} [active-${{ inputs.active_sha }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      active_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run for active_sha
+        required: true
+      uat_source_sha:
+        description: Immutable source SHA recorded by the interrupted UAT
+        required: true
+      uat_run_id:
+        description: Interrupted Video Pipeline V2 workflow run ID
+        required: true
+      uat_attempt:
+        description: Interrupted workflow run attempt
+        required: true
+        default: '1'
+      harness_sha:
+        description: Immutable private-source SHA containing the cleanup harness
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate active deployment and interrupted UAT
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          UAT_SOURCE_SHA: ${{ inputs.uat_source_sha }}
+          UAT_RUN_ID: ${{ inputs.uat_run_id }}
+          UAT_ATTEMPT: ${{ inputs.uat_attempt }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ACTIVE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$UAT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$UAT_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$UAT_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          release_run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          uat_run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$UAT_RUN_ID")
+          RELEASE_RUN="$release_run" UAT_RUN="$uat_run" node - <<'NODE'
+          const release = JSON.parse(process.env.RELEASE_RUN);
+          const uat = JSON.parse(process.env.UAT_RUN);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(release.status === 'completed' && release.conclusion === 'success', 'Bound deployment is not successful');
+          assert(String(release.display_title || release.name).includes(process.env.ACTIVE_SHA), 'Bound deployment does not contain active SHA');
+          assert(uat.status === 'completed', 'Interrupted UAT is not terminal');
+          assert(uat.event === 'workflow_dispatch', 'Recovery target is not a workflow_dispatch run');
+          assert(String(uat.path || '').includes('verify-video-pipeline-v2.yml'), 'Recovery target is not the V2 UAT workflow');
+          assert(String(uat.display_title || uat.name).includes(`verify video-pipeline-v2 ${process.env.UAT_SOURCE_SHA}`), 'UAT title does not contain its source SHA');
+          assert(Number(uat.run_attempt) === Number(process.env.UAT_ATTEMPT), 'UAT attempt does not match');
+          NODE
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Checkout immutable cleanup harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install pinned SSH runtime
+        shell: bash
+        env:
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-v2-cleanup-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-v2-cleanup-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 720s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-v2-cleanup:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Remove the exact interrupted UAT account, tasks, reservations, and OSS objects
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          UAT_RUN_ID: ${{ inputs.uat_run_id }}
+          UAT_ATTEMPT: ${{ inputs.uat_attempt }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="pipeline-v2-uat-${UAT_RUN_ID}-${UAT_ATTEMPT}"
+          mkdir -p recovery-artifacts "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            < source/.github/e2e/production-video-pipeline-v2-cleanup.cjs)
+          cleanup=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$cleanup" | tee recovery-artifacts/cleanup-evidence.json
+          CLEANUP_JSON="$cleanup" node - <<'NODE'
+          const cleanup = JSON.parse(process.env.CLEANUP_JSON);
+          if (cleanup.cleanupComplete !== true) throw new Error('Cleanup did not report completion');
+          if (!Number.isInteger(cleanup.accountCount) || cleanup.accountCount < 0 || cleanup.accountCount > 1) {
+            throw new Error('Cleanup account count is outside the exact-prefix boundary');
+          }
+          NODE
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: video-pipeline-v2-cleanup-recovery-${{ inputs.uat_run_id }}-${{ inputs.uat_attempt }}
+          path: recovery-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record exact cleanup recovery
+        if: success()
+        run: |
+          echo 'video_pipeline_v2_cleanup_recovery=passed'
+          echo 'uat_run_id=${{ inputs.uat_run_id }}'
+          echo 'uat_attempt=${{ inputs.uat_attempt }}'
+          echo 'active_sha=${{ inputs.active_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'
