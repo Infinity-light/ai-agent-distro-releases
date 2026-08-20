@@ -192,6 +192,7 @@ jobs:
           python3 - <<'PY'
           import os
           import pathlib
+          import re
           import zipfile
 
           root = pathlib.Path('uat-artifacts')
@@ -200,11 +201,14 @@ jobs:
           )]
           needles = [value.encode() for value in values if len(value) >= 8]
           replacement = b'[REDACTED-UAT-CREDENTIAL]'
+          jwt_pattern = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+          account_pattern = re.compile(rb'chat-composer-uat-[0-9-]+-[ab](?:@test\.local)?')
 
           def redact(data):
               for needle in needles:
                   data = data.replace(needle, replacement)
-              return data
+              data = jwt_pattern.sub(replacement, data)
+              return account_pattern.sub(b'[REDACTED-UAT-ACCOUNT]', data)
 
           for archive in root.glob('*-trace.zip'):
               temporary = archive.with_suffix('.sanitized.zip')
@@ -227,6 +231,8 @@ jobs:
                   blobs = [item.read_bytes()]
               if any(needle in blob for needle in needles for blob in blobs):
                   raise SystemExit(f'credential remains in {item.name}')
+              if any(jwt_pattern.search(blob) or account_pattern.search(blob) for blob in blobs):
+                  raise SystemExit(f'rotated credential or account identifier remains in {item.name}')
           print(f'sanitized_trace_count={len(list(root.glob("*-trace.zip")))}')
           PY
 
