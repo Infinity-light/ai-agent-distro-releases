@@ -203,12 +203,14 @@ jobs:
           replacement = b'[REDACTED-UAT-CREDENTIAL]'
           jwt_pattern = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
           account_pattern = re.compile(rb'chat-composer-uat-[0-9-]+-[ab](?:@test\.local)?')
+          file_token_pattern = re.compile(rb'(?<=token=)[A-Za-z0-9_-]{20,}')
 
           def redact(data):
               for needle in needles:
                   data = data.replace(needle, replacement)
               data = jwt_pattern.sub(replacement, data)
-              return account_pattern.sub(b'[REDACTED-UAT-ACCOUNT]', data)
+              data = account_pattern.sub(b'[REDACTED-UAT-ACCOUNT]', data)
+              return file_token_pattern.sub(replacement, data)
 
           for archive in root.glob('*-trace.zip'):
               temporary = archive.with_suffix('.sanitized.zip')
@@ -231,8 +233,8 @@ jobs:
                   blobs = [item.read_bytes()]
               if any(needle in blob for needle in needles for blob in blobs):
                   raise SystemExit(f'credential remains in {item.name}')
-              if any(jwt_pattern.search(blob) or account_pattern.search(blob) for blob in blobs):
-                  raise SystemExit(f'rotated credential or account identifier remains in {item.name}')
+              if any(jwt_pattern.search(blob) or account_pattern.search(blob) or file_token_pattern.search(blob) for blob in blobs):
+                  raise SystemExit(f'rotated credential, account identifier, or file token remains in {item.name}')
           print(f'sanitized_trace_count={len(list(root.glob("*-trace.zip")))}')
           PY
 
