@@ -62,6 +62,7 @@ jobs:
           node --env-file="$APP_ROOT/shared/.env" <<'NODE'
           const { PrismaClient } = require('@prisma/client');
           const crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
           const fs = require('node:fs');
           const os = require('node:os');
           const path = require('node:path');
@@ -76,8 +77,10 @@ jobs:
 
           function sanitize(value) {
             return String(value || '')
+              .replace(/\u001b\[[0-9;]*m/g, '')
               .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
               .replace(/([?&](?:token|signature|x-oss-signature|access_key_id)=)[^&\s]+/gi, '$1[REDACTED]')
+              .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, '[ID]')
               .replace(/\b1[3-9]\d{9}\b/g, '[PHONE]')
               .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
               .slice(0, 1200);
@@ -100,10 +103,34 @@ jobs:
           function relevantAppLogs() {
             const logDir = path.join(os.homedir(), '.pm2', 'logs');
             const files = ['zhiduoduo-platform-error.log', 'zhiduoduo-platform-out.log'];
-            return files.flatMap((name) => readTail(path.join(logDir, name)).split(/\r?\n/)
-              .filter((line) => /Seedance|VideoGeneration|video task|视频|BadGateway|request failed|provider/i.test(line))
-              .slice(-250)
-              .map((line) => ({ source: name, line: sanitize(line) })));
+            const sources = files.map((name) => ({ source: name, body: readTail(path.join(logDir, name)) }));
+            try {
+              sources.push({
+                source: 'pm2:zhiduoduo-platform',
+                body: execFileSync('pm2', ['logs', 'zhiduoduo-platform', '--lines', '1200', '--nostream', '--raw'], {
+                  encoding: 'utf8',
+                  maxBuffer: 8 * 1024 * 1024,
+                  stdio: ['ignore', 'pipe', 'pipe'],
+                }),
+              });
+            } catch (error) {
+              sources.push({
+                source: 'pm2:zhiduoduo-platform',
+                body: `${error?.stdout || ''}\n${error?.stderr || ''}`,
+              });
+            }
+            return sources.flatMap(({ source, body }) => {
+              const lines = String(body || '').split(/\r?\n/);
+              const selected = new Set();
+              lines.forEach((line, index) => {
+                if (!/VideoCompositionService|composition failed|zdd-video-compose-|filter_complex/i.test(line)) return;
+                for (let cursor = Math.max(0, index - 3); cursor <= Math.min(lines.length - 1, index + 24); cursor += 1) {
+                  selected.add(cursor);
+                }
+              });
+              return [...selected].sort((a, b) => a - b).slice(-350)
+                .map((index) => ({ source, line: sanitize(lines[index]) }));
+            });
           }
 
           function relevantNginxLogs() {
