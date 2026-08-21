@@ -1,0 +1,353 @@
+name: Diagnose Zhiduoduo Director V2 Production
+run-name: "diagnose director-v2 run=${{ inputs.uat_run_id }} attempt=${{ inputs.uat_attempt }} [${{ inputs.source_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Active immutable production release SHA
+        required: true
+      uat_run_id:
+        description: Running Director V2 UAT workflow run ID
+        required: true
+      uat_attempt:
+        description: Running Director V2 UAT workflow attempt
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zhiduoduo-director-v2-readonly-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Collect read-only Director, production, provider, QC, and composition state
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          UAT_RUN_ID: ${{ inputs.uat_run_id }}
+          UAT_ATTEMPT: ${{ inputs.uat_attempt }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$UAT_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$UAT_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          UAT_PREFIX="director-contract-v2-uat-${UAT_RUN_ID}-${UAT_ATTEMPT}"
+          install -d -m 700 "$HOME/.ssh" diagnostic-artifacts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' UAT_PREFIX='$UAT_PREFIX' bash -se" > diagnostic-artifacts/director-v2-state.json <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const { createHash } = require('node:crypto');
+          const prisma = new PrismaClient();
+          const collectedAt = new Date();
+          const activeAttemptStatuses = new Set(['SUBMIT_READY', 'SUBMITTING', 'RETRY_WAIT', 'SUBMITTED', 'QUEUED', 'RUNNING', 'QUALITY_REVIEW']);
+          const terminalProductionStatuses = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+          function assert(condition, message) {
+            if (!condition) throw new Error(message);
+          }
+
+          function ref(value) {
+            return value ? createHash('sha256').update(String(value)).digest('hex').slice(0, 12) : null;
+          }
+
+          function clean(value, max = 280) {
+            if (!value) return null;
+            return String(value)
+              .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+              .replace(/([?&](?:token|signature|x-oss-signature|access_key_id)=)[^&\s]+/gi, '$1[REDACTED]')
+              .replace(/\b1[3-9]\d{9}\b/g, '[PHONE]')
+              .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
+              .slice(0, max);
+          }
+
+          function object(value) {
+            return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+          }
+
+          function iso(value) {
+            return value ? new Date(value).toISOString() : null;
+          }
+
+          function ageSeconds(value) {
+            return value ? Math.max(0, Math.round((collectedAt.getTime() - new Date(value).getTime()) / 1000)) : null;
+          }
+
+          function checks(value) {
+            return Array.isArray(value) ? value.slice(0, 30).map((item) => ({
+              code: clean(object(item).code, 80),
+              status: clean(object(item).status, 40),
+              measured: ['string', 'number', 'boolean'].includes(typeof object(item).measured) ? object(item).measured : null,
+              expected: ['string', 'number', 'boolean'].includes(typeof object(item).expected) ? object(item).expected : null,
+            })) : [];
+          }
+
+          function latest(values) {
+            return values.filter(Boolean).map((value) => new Date(value)).sort((a, b) => b - a)[0] || null;
+          }
+
+          (async () => {
+            const prefix = process.env.UAT_PREFIX;
+            assert(/^director-contract-v2-uat-[0-9]+-[1-9][0-9]*$/.test(prefix || ''), 'Invalid isolated UAT prefix');
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: `${prefix}-` } },
+              orderBy: { createdAt: 'asc' },
+              select: { id: true, role: true, createdAt: true, updatedAt: true },
+            });
+            const userIds = users.map((item) => item.id);
+
+            const [projects, productions, legacyGenerations, chatRequests, chatActions] = userIds.length ? await Promise.all([
+              prisma.videoCreativeProject.findMany({
+                where: { userId: { in: userIds } },
+                orderBy: { createdAt: 'asc' },
+                include: {
+                  revisions: { orderBy: { revision: 'desc' }, take: 3, select: { revision: true, reason: true, actorType: true, createdAt: true } },
+                  artifacts: { orderBy: { updatedAt: 'desc' }, take: 20, select: { id: true, stage: true, version: true, contractRevision: true, status: true, invalidatedByRevision: true, createdAt: true, updatedAt: true } },
+                  events: { orderBy: { createdAt: 'desc' }, take: 30, select: { type: true, stage: true, contractRevision: true, actorType: true, durationMs: true, createdAt: true } },
+                },
+              }),
+              prisma.videoProduction.findMany({
+                where: { userId: { in: userIds } },
+                orderBy: { createdAt: 'asc' },
+                include: {
+                  shots: {
+                    orderBy: { orderIndex: 'asc' },
+                    include: {
+                      attempts: { orderBy: { attemptNo: 'asc' }, include: { reviews: { orderBy: { createdAt: 'asc' } } } },
+                      dependencies: { select: { kind: true, hard: true, assetRole: true, dependsOnShotId: true } },
+                    },
+                  },
+                  assets: { orderBy: [{ kind: 'asc' }, { version: 'asc' }] },
+                  events: { orderBy: { createdAt: 'desc' }, take: 80 },
+                  leases: { orderBy: { updatedAt: 'asc' } },
+                },
+              }),
+              prisma.aiGeneration.findMany({
+                where: { userId: { in: userIds }, type: 'VIDEO' },
+                orderBy: { createdAt: 'asc' },
+                select: { id: true, status: true, providerTaskId: true, relatedId: true, createdAt: true, updatedAt: true },
+              }),
+              prisma.aiChatRequest.findMany({
+                where: { userId: { in: userIds } },
+                orderBy: { createdAt: 'desc' },
+                take: 12,
+                select: { status: true, streamMode: true, retryable: true, errorCode: true, startedAt: true, completedAt: true, failedAt: true, updatedAt: true },
+              }),
+              prisma.aiChatAction.findMany({
+                where: { userId: { in: userIds } },
+                orderBy: { createdAt: 'desc' },
+                take: 20,
+                select: { id: true, kind: true, toolName: true, status: true, retryable: true, attempts: true, creativeProjectId: true, creativeStage: true, contractRevision: true, decisionKey: true, errorCode: true, startedAt: true, completedAt: true, cancelledAt: true, createdAt: true, updatedAt: true },
+              }),
+            ]) : [[], [], [], [], []];
+
+            const modelIds = [...new Set(productions.flatMap((production) => production.shots.flatMap((shot) => [shot.modelDefinitionId, ...shot.attempts.map((attempt) => attempt.modelDefinitionId)]).filter(Boolean)))];
+            const models = modelIds.length ? await prisma.aiModelDefinition.findMany({
+              where: { id: { in: modelIds } },
+              select: {
+                id: true, displayName: true, providerModelId: true, enabled: true, executable: true, healthStatus: true, lastHealthAt: true,
+                connection: { select: { adapter: true, enabled: true, healthStatus: true, lastHealthAt: true, lastErrorCode: true } },
+              },
+            }) : [];
+            const modelById = new Map(models.map((item) => [item.id, item]));
+            const billingRefs = productions.flatMap((production) => production.shots.flatMap((shot) => shot.attempts.map((attempt) => attempt.billingReference)));
+            const [reservations, usage] = billingRefs.length ? await Promise.all([
+              prisma.creditReservation.findMany({ where: { referenceId: { in: billingRefs } }, select: { referenceId: true, amount: true, status: true, createdAt: true, settledAt: true, releasedAt: true } }),
+              prisma.tokenUsageLog.findMany({ where: { referenceId: { in: billingRefs } }, select: { referenceId: true, tokensUsed: true, model: true, durationMs: true, createdAt: true } }),
+            ]) : [[], []];
+            const reservationByRef = new Map(reservations.map((item) => [item.referenceId, item]));
+            const usageByRef = new Map(usage.map((item) => [item.referenceId, item]));
+
+            const productionState = productions.map((production) => {
+              const eventTimes = production.events.map((event) => event.createdAt);
+              const shotTimes = production.shots.flatMap((shot) => [shot.updatedAt, shot.readyAt, shot.startedAt, shot.completedAt, shot.failedAt]);
+              const attemptTimes = production.shots.flatMap((shot) => shot.attempts.flatMap((attempt) => [attempt.updatedAt, attempt.submittedAt, attempt.providerStartedAt, attempt.providerCompletedAt, attempt.completedAt, attempt.cancelledAt]));
+              const reviewTimes = production.shots.flatMap((shot) => shot.attempts.flatMap((attempt) => attempt.reviews.map((review) => review.createdAt)));
+              const assetTimes = production.assets.map((asset) => asset.updatedAt);
+              const leaseTimes = production.leases.map((lease) => lease.updatedAt);
+              const lastActivity = latest([production.updatedAt, production.compositionClaimedAt, production.completedAt, production.failedAt, ...eventTimes, ...shotTimes, ...attemptTimes, ...reviewTimes, ...assetTimes, ...leaseTimes]);
+              const activeAttempts = production.shots.flatMap((shot) => shot.attempts).filter((attempt) => activeAttemptStatuses.has(attempt.status));
+              const providerHeartbeat = latest(activeAttempts.map((attempt) => attempt.updatedAt));
+              const thresholdSeconds = production.status === 'COMPOSING' ? 900 : activeAttempts.length ? 120 : 300;
+              const terminal = terminalProductionStatuses.has(production.status);
+              const needsAttention = production.status === 'NEEDS_ATTENTION' || production.shots.some((shot) => shot.status === 'NEEDS_ATTENTION');
+              const heartbeatFresh = providerHeartbeat ? ageSeconds(providerHeartbeat) <= 90 : false;
+              const isActuallyProgressing = !terminal && !needsAttention && (heartbeatFresh || ageSeconds(lastActivity) <= thresholdSeconds);
+              const stalled = !terminal && !needsAttention && !isActuallyProgressing;
+              let diagnosticState = 'progressing';
+              if (terminal) diagnosticState = 'terminal';
+              else if (needsAttention) diagnosticState = 'needs_attention';
+              else if (stalled) diagnosticState = 'stalled';
+              const selectedAttemptIds = new Set(production.shots.map((shot) => shot.selectedAttemptId).filter(Boolean));
+              return {
+                productionRef: ref(production.id),
+                creativeProjectRef: ref(production.creativeProjectId),
+                legacyGenerationRef: ref(production.generationId),
+                origin: production.origin,
+                status: production.status,
+                version: production.version,
+                maxParallelism: production.maxParallelism,
+                actualCredits: production.actualCredits,
+                hasOutputVideo: Boolean(production.outputVideoUrl),
+                errorMessage: clean(production.errorMessage),
+                contractRevision: production.contractRevision,
+                contractHashRef: ref(production.contractHash),
+                specHashRef: ref(production.specHash),
+                timeline: {
+                  createdAt: iso(production.createdAt), startedAt: iso(production.startedAt), updatedAt: iso(production.updatedAt),
+                  compositionClaimedAt: iso(production.compositionClaimedAt), completedAt: iso(production.completedAt), failedAt: iso(production.failedAt),
+                  nextReconcileAt: iso(production.nextReconcileAt), latestActivityAt: iso(lastActivity), latestActivityAgeSeconds: ageSeconds(lastActivity),
+                  providerHeartbeatAt: iso(providerHeartbeat), providerHeartbeatAgeSeconds: ageSeconds(providerHeartbeat),
+                },
+                assessment: { state: diagnosticState, isActuallyProgressing, stalled, needsAttention, thresholdSeconds },
+                counts: {
+                  shots: production.shots.length,
+                  completedShots: production.shots.filter((shot) => shot.status === 'COMPLETED').length,
+                  activeShots: production.shots.filter((shot) => ['RESERVING_RETRY', 'READY', 'QUEUED', 'RUNNING', 'QUALITY_REVIEW'].includes(shot.status)).length,
+                  attempts: production.shots.reduce((sum, shot) => sum + shot.attempts.length, 0),
+                  activeAttempts: activeAttempts.length,
+                  qualityReviews: production.shots.reduce((sum, shot) => sum + shot.attempts.reduce((inner, attempt) => inner + attempt.reviews.length, 0), 0),
+                  activeLeases: production.leases.length,
+                },
+                composition: {
+                  status: production.status === 'COMPOSING' ? 'RUNNING' : production.outputVideoUrl ? 'COMPLETED' : 'NOT_COMPLETED',
+                  claimedAt: iso(production.compositionClaimedAt),
+                  hasOutputVideo: Boolean(production.outputVideoUrl),
+                  events: production.events.filter((event) => event.stage === 'composition' || /COMPOSITION|COMPOSED/.test(event.type)).slice(0, 12).reverse().map((event) => ({ type: event.type, stage: event.stage, durationMs: event.durationMs, createdAt: iso(event.createdAt) })),
+                },
+                shots: production.shots.map((shot) => ({
+                  shotRef: ref(shot.id),
+                  shotKey: shot.shotKey,
+                  orderIndex: shot.orderIndex,
+                  durationSeconds: shot.durationSeconds,
+                  status: shot.status,
+                  retryCount: shot.retryCount,
+                  executionMode: shot.executionMode,
+                  selectedAttemptRef: ref(shot.selectedAttemptId),
+                  dependencies: shot.dependencies.map((dependency) => ({ dependsOnShotRef: ref(dependency.dependsOnShotId), kind: dependency.kind, hard: dependency.hard, assetRole: dependency.assetRole })),
+                  timeline: { readyAt: iso(shot.readyAt), startedAt: iso(shot.startedAt), updatedAt: iso(shot.updatedAt), completedAt: iso(shot.completedAt), failedAt: iso(shot.failedAt) },
+                  attempts: shot.attempts.map((attempt) => {
+                    const snapshot = object(attempt.providerSnapshot);
+                    const model = modelById.get(attempt.modelDefinitionId || shot.modelDefinitionId);
+                    const reservation = reservationByRef.get(attempt.billingReference);
+                    const charge = usageByRef.get(attempt.billingReference);
+                    return {
+                      attemptRef: ref(attempt.id),
+                      attemptNo: attempt.attemptNo,
+                      selected: selectedAttemptIds.has(attempt.id),
+                      status: attempt.status,
+                      executionMode: attempt.executionMode,
+                      provider: {
+                        adapter: clean(snapshot.adapter || model?.connection?.adapter, 80),
+                        model: clean(snapshot.providerReportedModel || snapshot.providerModelId || model?.providerModelId, 120),
+                        definitionHealth: model ? { enabled: model.enabled, executable: model.executable, status: model.healthStatus, lastHealthAt: iso(model.lastHealthAt) } : null,
+                        connectionHealth: model ? { enabled: model.connection.enabled, status: model.connection.healthStatus, lastHealthAt: iso(model.connection.lastHealthAt), lastErrorCode: clean(model.connection.lastErrorCode, 100) } : null,
+                        taskRef: ref(attempt.providerTaskId),
+                        requestRef: ref(attempt.providerRequestId),
+                        submissionAttempts: Number(snapshot.submissionAttempts || 0),
+                        polledStatus: attempt.status,
+                        heartbeatAt: iso(attempt.updatedAt),
+                        heartbeatAgeSeconds: ageSeconds(attempt.updatedAt),
+                        nextPollAt: iso(attempt.backoffUntil),
+                        heartbeatFresh: activeAttemptStatuses.has(attempt.status) && ageSeconds(attempt.updatedAt) <= 90,
+                      },
+                      qc: attempt.reviews.map((review) => ({ status: review.status, reviewerType: review.reviewerType, checks: checks(review.checks), publicSummary: clean(review.publicSummary), createdAt: iso(review.createdAt) })),
+                      billing: { estimatedCredits: attempt.estimatedCredits, actualCredits: attempt.actualCredits, reservationStatus: reservation?.status || null, reservedCredits: reservation?.amount || 0, chargedCredits: charge?.tokensUsed || 0 },
+                      retryable: attempt.retryable,
+                      errorCode: clean(attempt.errorCode, 100),
+                      errorMessage: clean(attempt.errorMessage),
+                      hasVideo: Boolean(attempt.videoUrl),
+                      hasLastFrame: Boolean(attempt.lastFrameUrl),
+                      timeline: {
+                        queuedAt: iso(attempt.queuedAt), submittedAt: iso(attempt.submittedAt), providerStartedAt: iso(attempt.providerStartedAt),
+                        providerCompletedAt: iso(attempt.providerCompletedAt), completedAt: iso(attempt.completedAt), cancelledAt: iso(attempt.cancelledAt),
+                        timeoutAt: iso(attempt.timeoutAt), updatedAt: iso(attempt.updatedAt),
+                      },
+                    };
+                  }),
+                })),
+                assets: production.assets.map((asset) => ({ assetRef: ref(asset.id), kind: asset.kind, role: asset.role, version: asset.version, status: asset.status, sourceType: asset.sourceType, sourceGenerationRef: ref(asset.sourceGenerationId), isCurrent: asset.isCurrent, hasUrl: Boolean(asset.url), fallbackReason: clean(asset.fallbackReason), updatedAt: iso(asset.updatedAt) })),
+                activeLeases: production.leases.map((lease) => ({ shotRef: ref(lease.shotId), scopeType: lease.scopeType, slot: lease.slot, ownerRef: ref(lease.ownerKey), expiresAt: iso(lease.expiresAt), updatedAt: iso(lease.updatedAt) })),
+                eventTail: production.events.slice(0, 30).reverse().map((event) => ({ type: event.type, stage: event.stage, shotRef: ref(event.shotId), attemptRef: ref(event.attemptId), durationMs: event.durationMs, actualCredits: event.actualCredits, createdAt: iso(event.createdAt) })),
+              };
+            });
+
+            const projectState = projects.map((project) => {
+              const activity = latest([project.updatedAt, ...project.revisions.map((item) => item.createdAt), ...project.artifacts.map((item) => item.updatedAt), ...project.events.map((item) => item.createdAt)]);
+              return {
+                projectRef: ref(project.id), mode: project.mode, videoType: project.videoType, status: project.status,
+                currentStage: project.currentStage, currentRevision: project.currentRevision, updatedAt: iso(project.updatedAt),
+                latestActivityAt: iso(activity), latestActivityAgeSeconds: ageSeconds(activity),
+                revisions: project.revisions.slice().reverse().map((item) => ({ revision: item.revision, reason: clean(item.reason, 120), actorType: item.actorType, createdAt: iso(item.createdAt) })),
+                artifacts: project.artifacts.slice().reverse().map((item) => ({ artifactRef: ref(item.id), stage: item.stage, version: item.version, contractRevision: item.contractRevision, status: item.status, invalidatedByRevision: item.invalidatedByRevision, updatedAt: iso(item.updatedAt) })),
+                eventTail: project.events.slice().reverse().map((item) => ({ type: item.type, stage: item.stage, contractRevision: item.contractRevision, actorType: item.actorType, durationMs: item.durationMs, createdAt: iso(item.createdAt) })),
+              };
+            });
+
+            console.log(JSON.stringify({
+              release: process.env.EXPECTED_RELEASE,
+              uat: { runId: process.env.UAT_PREFIX.split('-').at(-2), attempt: process.env.UAT_PREFIX.split('-').at(-1), accountCount: users.length, accounts: users.map((user) => ({ userRef: ref(user.id), role: user.role, createdAt: iso(user.createdAt) })) },
+              collectedAt: collectedAt.toISOString(),
+              summary: {
+                creativeProjects: projects.length,
+                productions: productions.length,
+                legacyVideoGenerations: legacyGenerations.length,
+                actuallyProgressingProductions: productionState.filter((item) => item.assessment.isActuallyProgressing).length,
+                stalledProductions: productionState.filter((item) => item.assessment.stalled).length,
+                needsAttentionProductions: productionState.filter((item) => item.assessment.needsAttention).length,
+              },
+              creativeProjects: projectState,
+              productions: productionState,
+              legacyVideoGenerations: legacyGenerations.map((item) => ({ generationRef: ref(item.id), status: item.status, providerTaskRef: ref(item.providerTaskId), relatedRef: ref(item.relatedId), createdAt: iso(item.createdAt), updatedAt: iso(item.updatedAt) })),
+              latestChatRequests: chatRequests.slice().reverse().map((item) => ({ status: item.status, streamMode: item.streamMode, retryable: item.retryable, errorCode: clean(item.errorCode, 100), startedAt: iso(item.startedAt), completedAt: iso(item.completedAt), failedAt: iso(item.failedAt), updatedAt: iso(item.updatedAt) })),
+              latestChatActions: chatActions.slice().reverse().map((item) => ({ actionRef: ref(item.id), kind: item.kind, toolName: item.toolName, status: item.status, retryable: item.retryable, attempts: item.attempts, projectRef: ref(item.creativeProjectId), stage: item.creativeStage, contractRevision: item.contractRevision, decisionKey: clean(item.decisionKey, 120), errorCode: clean(item.errorCode, 100), startedAt: iso(item.startedAt), completedAt: iso(item.completedAt), cancelledAt: iso(item.cancelledAt), updatedAt: iso(item.updatedAt) })),
+              readOnly: true,
+            }, null, 2));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+
+      - name: Upload sanitized read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: director-v2-readonly-diagnostic-${{ inputs.uat_run_id }}-${{ inputs.uat_attempt }}
+          path: diagnostic-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record read-only boundary
+        run: |
+          echo 'director_v2_diagnostic=completed'
+          echo 'mutations=none'
+          echo 'uat_run_id=${{ inputs.uat_run_id }}'
+          echo 'uat_attempt=${{ inputs.uat_attempt }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
