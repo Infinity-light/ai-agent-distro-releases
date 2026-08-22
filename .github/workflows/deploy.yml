@@ -118,6 +118,7 @@ jobs:
               "execFileSync('pm2', ['jlist']",
               'DirectMail managed source presence:',
               'No complete protected DirectMail configuration source is available',
+              'unset DM_ACCESS_KEY_ID DM_ACCESS_KEY_SECRET DM_ACCOUNT_NAME DM_ENDPOINT DM_SENDER_ALIAS',
               'Production SMS verification must remain disabled',
               'Missing production DirectMail configuration',
           ]
