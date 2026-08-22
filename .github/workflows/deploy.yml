@@ -106,7 +106,21 @@ jobs:
               if line and not line.startswith('            '):
                   raise SystemExit(f'unexpected deployment script indentation: {line[:80]}')
               lines.append(line[12:] if line else '')
-          Path('production-deploy.sh').write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+          script = '\n'.join(lines) + '\n'
+          required_delivery_contract = [
+              "VERIFICATION_PROVIDER: 'disabled'",
+              "VERIFICATION_SMS_PROVIDER: 'disabled'",
+              "VERIFICATION_EMAIL_PROVIDER: 'directmail'",
+              "MAIL_PROVIDER: 'directmail'",
+              "DM_ACCESS_KEY_ID: process.env.DM_ACCESS_KEY_ID || ''",
+              "DM_ACCESS_KEY_SECRET: process.env.DM_ACCESS_KEY_SECRET || ''",
+              'Production SMS verification must remain disabled',
+              'Missing production DirectMail configuration',
+          ]
+          missing = [item for item in required_delivery_contract if item not in script]
+          if missing:
+              raise SystemExit(f'production verification delivery contract missing: {missing}')
+          Path('production-deploy.sh').write_text(script, encoding='utf-8', newline='\n')
           PY
           bash -n production-deploy.sh
           tar -czf deploy.tar.gz \
