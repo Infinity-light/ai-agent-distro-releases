@@ -1,0 +1,178 @@
+name: Audit and Clean Zhiduoduo Email UAT
+run-name: "email UAT audit/cleanup ${{ inputs.user_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: Temporary Fleet email UAT user UUID
+        required: true
+      confirmation:
+        description: Must equal DELETE_FLEET_EMAIL_UAT
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  audit-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit verification delivery and remove the synthetic account
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          UAT_USER_ID: ${{ inputs.user_id }}
+          CLEANUP_CONFIRMATION: ${{ inputs.confirmation }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          fingerprint: SHA256:gy2tS+Z/+PjfElXqJ4oRRuVSpIeo8CfWyKOcXqB3FSI
+          command_timeout: 8m
+          envs: UAT_USER_ID,CLEANUP_CONFIRMATION
+          script: |
+            set -Eeuo pipefail
+            [[ "$UAT_USER_ID" =~ ^[0-9a-f-]{36}$ ]]
+            test "$CLEANUP_CONFIRMATION" = "DELETE_FLEET_EMAIL_UAT"
+
+            APP_ROOT=/opt/apps/zhiduoduo-platform
+            RELEASE_DIR=$(readlink -f "$APP_ROOT/current")
+            SHARED_ENV="$APP_ROOT/shared/.env"
+            test -f "$RELEASE_DIR/package.json"
+            test -f "$SHARED_ENV"
+            cd "$RELEASE_DIR"
+
+            node --env-file="$SHARED_ENV" <<'NODE'
+            const { createHash } = require('node:crypto');
+            const { PrismaClient } = require('@prisma/client');
+            const prisma = new PrismaClient();
+            const userId = process.env.UAT_USER_ID;
+            const beijing = (value = new Date()) => new Intl.DateTimeFormat('zh-CN', {
+              timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+              hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+            }).format(new Date(value));
+
+            (async () => {
+              const user = await prisma.user.findUnique({
+                where: { id: userId },
+                select: {
+                  id: true,
+                  name: true,
+                  phone: true,
+                  emailNormalized: true,
+                  emailVerifiedAt: true,
+                  role: true,
+                  createdAt: true,
+                },
+              });
+              if (!user
+                || !user.name.startsWith('Fleet Email UAT ')
+                || !/^199\d{8}$/.test(user.phone)
+                || user.role !== 'TERMINAL_USER'
+                || !user.emailNormalized
+                || !user.emailVerifiedAt
+                || Date.now() - user.createdAt.getTime() > 4 * 60 * 60 * 1000) {
+                throw new Error('Refusing to audit or delete a non-current Fleet email UAT account');
+              }
+
+              const challenges = await prisma.verificationChallenge.findMany({
+                where: { subjectUserId: userId },
+                select: {
+                  id: true,
+                  channel: true,
+                  purpose: true,
+                  attempts: true,
+                  consumedAt: true,
+                  invalidatedAt: true,
+                },
+                orderBy: { createdAt: 'asc' },
+              });
+              const challengeIds = challenges.map((challenge) => challenge.id);
+              const purposeByChallenge = new Map(challenges.map((challenge) => [challenge.id, challenge.purpose]));
+              const outboxes = challengeIds.length
+                ? await prisma.verificationOutbox.findMany({
+                    where: { challengeId: { in: challengeIds } },
+                    select: {
+                      id: true,
+                      challengeId: true,
+                      channel: true,
+                      status: true,
+                      providerRequestId: true,
+                      errorCode: true,
+                      attempts: true,
+                    },
+                    orderBy: { createdAt: 'asc' },
+                  })
+                : [];
+              const smsOutboxes = outboxes.filter((outbox) => outbox.channel === 'SMS');
+              const emailOutboxes = outboxes.filter((outbox) => outbox.channel === 'EMAIL');
+              if (smsOutboxes.length !== 0) {
+                throw new Error('SMS fail-closed invariant violated: an outbox exists');
+              }
+              if (emailOutboxes.length < 3
+                || emailOutboxes.some((outbox) => outbox.status !== 'SENT' || !outbox.providerRequestId)) {
+                throw new Error('Email UAT outbox acceptance evidence is incomplete');
+              }
+
+              const audit = {
+                atBeijing: beijing(),
+                userId,
+                targetHash12: createHash('sha256').update(user.emailNormalized).digest('hex').slice(0, 12),
+                challengeCount: challenges.length,
+                smsOutboxCount: smsOutboxes.length,
+                smsProviderRequestCount: smsOutboxes.filter((outbox) => outbox.providerRequestId).length,
+                emailOutboxes: emailOutboxes.map((outbox) => ({
+                  channel: outbox.channel,
+                  purpose: purposeByChallenge.get(outbox.challengeId),
+                  status: outbox.status,
+                  providerRequestId: outbox.providerRequestId,
+                  attempts: outbox.attempts,
+                  challengeSuffix: outbox.challengeId.slice(-8),
+                })),
+              };
+              console.log(`EMAIL_UAT_AUDIT=${JSON.stringify(audit)}`);
+
+              await prisma.$transaction(async (tx) => {
+                if (challengeIds.length) {
+                  await tx.verificationOutbox.deleteMany({ where: { challengeId: { in: challengeIds } } });
+                  await tx.verificationChallenge.deleteMany({ where: { id: { in: challengeIds } } });
+                }
+                const grants = await tx.creditGrant.findMany({ where: { userId }, select: { id: true } });
+                const grantIds = grants.map((grant) => grant.id);
+                if (grantIds.length) await tx.creditGrantEvent.deleteMany({ where: { grantId: { in: grantIds } } });
+                await tx.providerBillSample.deleteMany({ where: { createdById: userId } });
+                await tx.tokenUsageLog.deleteMany({ where: { userId } });
+                await tx.creditReservation.deleteMany({ where: { userId } });
+                await tx.creditGrant.deleteMany({ where: { userId } });
+                await tx.dailyTokenUsage.deleteMany({ where: { userId } });
+                await tx.tokenLedger.deleteMany({ where: { userId } });
+                await tx.generationAsset.deleteMany({ where: { userId } });
+                await tx.aiGeneration.deleteMany({ where: { userId } });
+                await tx.aiConversation.deleteMany({ where: { userId } });
+                await tx.businessProfile.deleteMany({ where: { userId } });
+                await tx.feedback.deleteMany({ where: { userId } });
+                await tx.activationCode.deleteMany({ where: { userId } });
+                await tx.transaction.deleteMany({ where: { userId } });
+                await tx.tokenPack.deleteMany({ where: { userId } });
+                await tx.agreement.deleteMany({ where: { userId } });
+                await tx.user.delete({ where: { id: userId } });
+              });
+
+              const [remainingUser, remainingChallenges, remainingOutboxes] = await Promise.all([
+                prisma.user.count({ where: { id: userId } }),
+                prisma.verificationChallenge.count({ where: { subjectUserId: userId } }),
+                challengeIds.length
+                  ? prisma.verificationOutbox.count({ where: { challengeId: { in: challengeIds } } })
+                  : Promise.resolve(0),
+              ]);
+              console.log(`EMAIL_UAT_CLEANUP=${JSON.stringify({
+                atBeijing: beijing(),
+                userId,
+                remainingUser,
+                remainingChallenges,
+                remainingOutboxes,
+              })}`);
+            })().finally(() => prisma.$disconnect());
+            NODE
