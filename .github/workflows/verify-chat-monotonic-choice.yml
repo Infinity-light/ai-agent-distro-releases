@@ -1,0 +1,201 @@
+name: Verify Zhiduoduo Monotonic Chat and Natural Choice Production
+run-name: "verify monotonic-chat ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing browser and ledger assertions
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Validate bound production release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node -e '
+            const run = JSON.parse(process.env.RUN);
+            if (run.status !== "completed" || run.conclusion !== "success") throw new Error("Bound deployment is not successful");
+            if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
+          '
+          health=$(curl --fail --silent --show-error --retry 4 --retry-delay 2 https://zhiduoduoai.com/api/health)
+          HEALTH="$health" node -e '
+            const health = JSON.parse(process.env.HEALTH);
+            const value = health.data || health;
+            if (value.status !== "ok" || value.release !== process.env.SOURCE_SHA) {
+              throw new Error(`Production health is not bound to ${process.env.SOURCE_SHA}`);
+            }
+          '
+
+      - name: Checkout immutable UAT harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install production browser acceptance runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime uat-artifacts
+          npm install --prefix runtime --no-package-lock --no-save @playwright/test@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./runtime/node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Create exact isolated primary and boundary identities
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          E2E_UAT_PREFIX="chat-monotonic-uat-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          REMOTE_LEDGER_PATH="/tmp/$E2E_UAT_PREFIX-ledger.cjs"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          echo "REMOTE_LEDGER_PATH=$REMOTE_LEDGER_PATH" >> "$GITHUB_ENV"
+          sshpass -p "$SERVER_PASSWORD" scp \
+            -P "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            source/.github/e2e/production-chat-monotonic-ledger.cjs \
+            "$SERVER_USER@$SERVER_HOST:$REMOTE_LEDGER_PATH"
+          setup_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER_PATH' setup")
+          PRIMARY_USER_ID=$(SETUP_JSON="$setup_json" node -e 'process.stdout.write(JSON.parse(process.env.SETUP_JSON).primary.userId)')
+          SECONDARY_USER_ID=$(SETUP_JSON="$setup_json" node -e 'process.stdout.write(JSON.parse(process.env.SETUP_JSON).secondary.userId)')
+          PRIMARY_TOKEN=$(SETUP_JSON="$setup_json" node -e 'process.stdout.write(JSON.parse(process.env.SETUP_JSON).primary.token)')
+          SECONDARY_TOKEN=$(SETUP_JSON="$setup_json" node -e 'process.stdout.write(JSON.parse(process.env.SETUP_JSON).secondary.token)')
+          echo "::add-mask::$PRIMARY_TOKEN"
+          echo "::add-mask::$SECONDARY_TOKEN"
+          echo "E2E_PRIMARY_USER_ID=$PRIMARY_USER_ID" >> "$GITHUB_ENV"
+          echo "E2E_SECONDARY_USER_ID=$SECONDARY_USER_ID" >> "$GITHUB_ENV"
+          echo "ZDD_UAT_TOKEN=$PRIMARY_TOKEN" >> "$GITHUB_ENV"
+          echo "ZDD_UAT_SECONDARY_TOKEN=$SECONDARY_TOKEN" >> "$GITHUB_ENV"
+          SETUP_JSON="$setup_json" node -e '
+            const value = JSON.parse(process.env.SETUP_JSON);
+            delete value.primary.token;
+            delete value.secondary.token;
+            require("node:fs").writeFileSync("uat-artifacts/setup.json", JSON.stringify(value, null, 2) + "\n");
+          '
+
+      - name: Run desktop natural-language monotonic Chat UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          ZDD_ACTIVE_SHA: ${{ inputs.source_sha }}
+          ZDD_UAT_OUTPUT_DIR: uat-artifacts
+          ZDD_UAT_PHASE: production
+          ZDD_UAT_VIEWPORT: desktop
+          NODE_PATH: ${{ github.workspace }}/runtime/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/e2e/chat-stream-production-uat.js
+
+      - name: Run 390px mobile natural-language monotonic Chat UAT
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          ZDD_ACTIVE_SHA: ${{ inputs.source_sha }}
+          ZDD_UAT_OUTPUT_DIR: uat-artifacts
+          ZDD_UAT_PHASE: production
+          ZDD_UAT_VIEWPORT: mobile
+          NODE_PATH: ${{ github.workspace }}/runtime/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/e2e/chat-stream-production-uat.js
+
+      - name: Reconcile raw model, public event, Tool, choice, and billing ledgers
+        if: always() && env.E2E_PRIMARY_USER_ID != ''
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' E2E_PRIMARY_USER_ID='$E2E_PRIMARY_USER_ID' E2E_SECONDARY_USER_ID='$E2E_SECONDARY_USER_ID' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER_PATH' audit" \
+            | tee uat-artifacts/ledger-audit.json
+
+      - name: Remove all current and preserved prior synthetic Chat facts
+        if: always() && env.E2E_UAT_PREFIX != ''
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          trap 'sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" "$SERVER_USER@$SERVER_HOST" "rm -f -- '$REMOTE_LEDGER_PATH'" >/dev/null 2>&1 || true' EXIT
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER_PATH' cleanup" \
+            | tee uat-artifacts/cleanup.json
+
+      - name: Upload immutable production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: monotonic-chat-natural-choice-production-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record production acceptance
+        run: |
+          echo 'production_monotonic_chat_natural_choice=passed'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'
