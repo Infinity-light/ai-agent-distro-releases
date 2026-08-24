@@ -1,5 +1,5 @@
 name: Verify Zhiduoduo Monotonic Chat and Natural Choice Production
-run-name: "verify monotonic-chat ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+run-name: "verify monotonic-chat ${{ inputs.source_sha }} [${{ inputs.uat_scope }} deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
 
 on:
   workflow_dispatch:
@@ -13,6 +13,14 @@ on:
       harness_sha:
         description: Immutable source SHA containing browser and ledger assertions
         required: true
+      uat_scope:
+        description: Run the complete browser gate or only prove isolated ledger setup and cleanup
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - ledger-preflight
 
 permissions:
   contents: read
@@ -63,6 +71,7 @@ jobs:
           path: source
 
       - name: Install production browser acceptance runtime
+        if: inputs.uat_scope == 'full'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -80,6 +89,7 @@ jobs:
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
         run: |
           set -Eeuo pipefail
+          mkdir -p uat-artifacts
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
           install -d -m 700 "$HOME/.ssh"
@@ -122,6 +132,7 @@ jobs:
           '
 
       - name: Run desktop natural-language monotonic Chat UAT
+        if: inputs.uat_scope == 'full'
         env:
           E2E_BASE_URL: https://zhiduoduoai.com
           ZDD_ACTIVE_SHA: ${{ inputs.source_sha }}
@@ -133,6 +144,7 @@ jobs:
         run: node source/e2e/chat-stream-production-uat.js
 
       - name: Run 390px mobile natural-language monotonic Chat UAT
+        if: inputs.uat_scope == 'full'
         env:
           E2E_BASE_URL: https://zhiduoduoai.com
           ZDD_ACTIVE_SHA: ${{ inputs.source_sha }}
@@ -144,7 +156,7 @@ jobs:
         run: node source/e2e/chat-stream-production-uat.js
 
       - name: Reconcile raw model, public event, Tool, choice, and billing ledgers
-        if: always() && env.E2E_PRIMARY_USER_ID != ''
+        if: always() && inputs.uat_scope == 'full' && env.E2E_PRIMARY_USER_ID != ''
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -188,14 +200,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: monotonic-chat-natural-choice-production-${{ inputs.source_sha }}
+          name: monotonic-chat-${{ inputs.uat_scope }}-${{ inputs.source_sha }}
           path: uat-artifacts/
           if-no-files-found: error
           retention-days: 30
 
       - name: Record production acceptance
+        if: inputs.uat_scope == 'full'
         run: |
           echo 'production_monotonic_chat_natural_choice=passed'
           echo 'release_run_id=${{ inputs.release_run_id }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'
+
+      - name: Record isolated ledger preflight
+        if: inputs.uat_scope == 'ledger-preflight'
+        run: |
+          echo 'production_chat_isolated_ledger_setup_cleanup=passed'
           echo 'source_sha=${{ inputs.source_sha }}'
           echo 'harness_sha=${{ inputs.harness_sha }}'
