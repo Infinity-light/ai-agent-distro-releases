@@ -41,6 +41,14 @@ jobs:
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           path: source
 
+      - name: Install read-only browser runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime diagnostic-artifacts/dom
+          npm install --prefix runtime --no-package-lock --no-save @playwright/test@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./runtime/node_modules/.bin/playwright install --with-deps chromium
+
       - name: Collect bounded read-only chat evidence
         shell: bash
         env:
@@ -74,6 +82,46 @@ jobs:
             "$SERVER_USER@$SERVER_HOST" \
             "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' SUMMARY_ONLY=1 node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_COLLECTOR'" \
             > diagnostic-artifacts/latest-admin-chat-readonly.json
+
+      - name: Mint a short-lived read-only browser session
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          REMOTE_AUTH="/tmp/zdd-latest-admin-auth-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
+          trap 'sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" "$SERVER_USER@$SERVER_HOST" "rm -f -- '\''$REMOTE_AUTH'\''" >/dev/null 2>&1 || true' EXIT
+          sshpass -p "$SERVER_PASSWORD" scp \
+            -P "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            source/.workflow/verification/zdd-flat-chat-events/latest-admin-readonly-auth.cjs \
+            "$SERVER_USER@$SERVER_HOST:$REMOTE_AUTH"
+          auth_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_AUTH'")
+          token=$(AUTH_JSON="$auth_json" node -e 'process.stdout.write(JSON.parse(process.env.AUTH_JSON).token)')
+          conversation_id=$(AUTH_JSON="$auth_json" node -e 'process.stdout.write(JSON.parse(process.env.AUTH_JSON).conversationId)')
+          echo "::add-mask::$token"
+          echo "::add-mask::$conversation_id"
+          echo "ZDD_READONLY_TOKEN=$token" >> "$GITHUB_ENV"
+          echo "ZDD_READONLY_CONVERSATION_ID=$conversation_id" >> "$GITHUB_ENV"
+
+      - name: Inspect history and DOM without mutations
+        env:
+          E2E_BASE_URL: https://zhiduoduoai.com
+          ZDD_READONLY_OUTPUT_DIR: diagnostic-artifacts/dom
+          NODE_PATH: ${{ github.workspace }}/runtime/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/e2e/latest-admin-readonly-dom.js
 
       - name: Upload bounded read-only evidence
         if: always()
