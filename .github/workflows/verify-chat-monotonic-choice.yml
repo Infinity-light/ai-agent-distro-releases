@@ -54,11 +54,19 @@ jobs:
             if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error("Deployment is not bound to SOURCE_SHA");
           '
           health=$(curl --fail --silent --show-error --retry 4 --retry-delay 2 https://zhiduoduoai.com/api/health)
+          version=$(curl --fail --silent --show-error --retry 4 --retry-delay 2 \
+            "https://zhiduoduoai.com/version.json?uatRun=$GITHUB_RUN_ID")
           HEALTH="$health" node -e '
             const health = JSON.parse(process.env.HEALTH);
             const value = health.data || health;
             if (value.status !== "ok" || value.release !== process.env.SOURCE_SHA) {
               throw new Error(`Production health is not bound to ${process.env.SOURCE_SHA}`);
+            }
+          '
+          VERSION="$version" node -e '
+            const version = JSON.parse(process.env.VERSION);
+            if (version.releaseId !== process.env.SOURCE_SHA) {
+              throw new Error(`Storefront/PWA release is not bound to ${process.env.SOURCE_SHA}`);
             }
           '
 

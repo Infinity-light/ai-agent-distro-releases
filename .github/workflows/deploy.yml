@@ -77,6 +77,11 @@ jobs:
           cache: pnpm
 
       - name: Install, audit, test, and build release
+        env:
+          # The workflow runs in the public proxy repository, so GITHUB_SHA is
+          # the proxy revision rather than the immutable application release.
+          # Bind Vite/PWA metadata to the resolved private source SHA.
+          VITE_RELEASE_SHA: ${{ steps.source.outputs.source_sha }}
         run: |
           set -Eeuo pipefail
           pnpm install --frozen-lockfile
@@ -86,6 +91,13 @@ jobs:
           pnpm build
           pnpm --filter @zhiduoduo/storefront exec tsc --noEmit
           pnpm --filter @zhiduoduo/storefront build
+          node -e '
+            const fs = require("node:fs");
+            const version = JSON.parse(fs.readFileSync("apps/storefront/dist/version.json", "utf8"));
+            if (version.releaseId !== process.env.VITE_RELEASE_SHA) {
+              throw new Error(`Storefront release ${version.releaseId} is not bound to ${process.env.VITE_RELEASE_SHA}`);
+            }
+          '
           pnpm --filter @zhiduoduo/admin exec tsc --noEmit
           pnpm --filter @zhiduoduo/admin build
 
