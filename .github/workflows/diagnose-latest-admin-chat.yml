@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y -qq sshpass
           install -d -m 700 "$HOME/.ssh"
           if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
-          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYQxUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
           REMOTE_COLLECTOR="/tmp/zdd-latest-admin-chat-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
           trap 'sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" "$SERVER_USER@$SERVER_HOST" "rm -f -- '\''$REMOTE_COLLECTOR'\''" >/dev/null 2>&1 || true' EXIT
