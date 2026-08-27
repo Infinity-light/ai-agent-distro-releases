@@ -1,0 +1,151 @@
+name: Diagnose Zhiduoduo Request Error
+run-name: "diagnose request ${{ inputs.request_id }} [${{ inputs.source_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Active immutable production release SHA
+        required: true
+      request_id:
+        description: Exact public X-Request-Id to inspect
+        required: true
+      request_key:
+        description: Exact isolated chat request key to inspect
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zhiduoduo-request-error-readonly
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Collect exact bounded and sanitized request evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          REQUEST_KEY: ${{ inputs.request_key }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUEST_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+          [[ "$REQUEST_KEY" =~ ^seedance-protocol-paid:[0-9]+:[1-4]$ ]]
+          install -d -m 700 "$HOME/.ssh" diagnostic-artifacts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          request_id_b64=$(printf '%s' "$REQUEST_ID" | base64 -w0)
+          request_key_b64=$(printf '%s' "$REQUEST_KEY" | base64 -w0)
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' REQUEST_ID_B64='$request_id_b64' REQUEST_KEY_B64='$request_key_b64' bash -se" \
+            > diagnostic-artifacts/request-error.json <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node <<'NODE'
+          const { execFileSync } = require('node:child_process');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+
+          const expectedRelease = process.env.EXPECTED_RELEASE;
+          const requestId = Buffer.from(process.env.REQUEST_ID_B64, 'base64').toString('utf8');
+          const requestKey = Buffer.from(process.env.REQUEST_KEY_B64, 'base64').toString('utf8');
+
+          function tail(file, maxBytes = 16 * 1024 * 1024) {
+            try {
+              const stat = fs.statSync(file);
+              const size = Math.min(stat.size, maxBytes);
+              const buffer = Buffer.alloc(size);
+              const fd = fs.openSync(file, 'r');
+              fs.readSync(fd, buffer, 0, size, stat.size - size);
+              fs.closeSync(fd);
+              return buffer.toString('utf8');
+            } catch {
+              return '';
+            }
+          }
+
+          function sanitize(value) {
+            return String(value || '')
+              .replace(/\u001b\[[0-9;]*m/g, '')
+              .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+              .replace(/([?&](?:token|signature|x-oss-signature|access_key_id)=)[^&\s]+/gi, '$1[REDACTED]')
+              .replace(/\b1[3-9]\d{9}\b/g, '[PHONE]')
+              .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
+              .slice(0, 2000);
+          }
+
+          const files = new Set([
+            path.join(os.homedir(), '.pm2', 'logs', 'zhiduoduo-platform-out.log'),
+            path.join(os.homedir(), '.pm2', 'logs', 'zhiduoduo-platform-error.log'),
+          ]);
+          try {
+            const processes = JSON.parse(execFileSync('pm2', ['jlist'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }));
+            const app = processes.find((item) => item?.name === 'zhiduoduo-platform');
+            if (app?.pm2_env?.pm_out_log_path) files.add(app.pm2_env.pm_out_log_path);
+            if (app?.pm2_env?.pm_err_log_path) files.add(app.pm2_env.pm_err_log_path);
+          } catch {}
+
+          const matches = [];
+          for (const file of files) {
+            const lines = tail(file).split(/\r?\n/);
+            const selected = new Set();
+            lines.forEach((line, index) => {
+              if (!line.includes(requestId) && !line.includes(requestKey)) return;
+              for (let cursor = Math.max(0, index - 30); cursor <= Math.min(lines.length - 1, index + 30); cursor += 1) {
+                selected.add(cursor);
+              }
+            });
+            if (selected.size) {
+              matches.push({
+                source: path.basename(file),
+                lines: [...selected].sort((a, b) => a - b).map((index) => sanitize(lines[index])),
+              });
+            }
+          }
+
+          console.log(JSON.stringify({
+            release: expectedRelease,
+            requestId,
+            requestKey,
+            matchedSources: matches.length,
+            matches,
+          }, null, 2));
+          NODE
+          REMOTE
+
+      - name: Require a traceable match
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node -e "const x=require('./diagnostic-artifacts/request-error.json'); if (!(x.matchedSources > 0)) throw new Error('No matching production log evidence');"
+
+      - name: Upload bounded read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: request-error-${{ inputs.request_id }}
+          path: diagnostic-artifacts/
+          if-no-files-found: error
+          retention-days: 1
