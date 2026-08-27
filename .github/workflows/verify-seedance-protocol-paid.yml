@@ -113,8 +113,11 @@ jobs:
           E2E_USER_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).userId)')
           E2E_USER_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).token)')
           E2E_MODEL_DEFINITION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).modelDefinitionId)')
+          E2E_CONVERSATION_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).conversationId)')
+          E2E_PROJECT_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).projectId)')
+          E2E_PLAN_REVISION=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(String(JSON.parse(process.env.UAT_JSON).planRevision))')
           E2E_ASSETS_JSON=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.stringify(JSON.parse(process.env.UAT_JSON).assets))')
-          for value in "$E2E_USER_ID" "$E2E_USER_TOKEN"; do echo "::add-mask::$value"; done
+          for value in "$E2E_USER_ID" "$E2E_USER_TOKEN" "$E2E_CONVERSATION_ID" "$E2E_PROJECT_ID"; do echo "::add-mask::$value"; done
           UAT_JSON="$uat_json" node -e '
             for (const asset of JSON.parse(process.env.UAT_JSON).assets) {
               for (const value of [asset.materialId, asset.generationId, asset.url, asset.objectKey]) console.log(`::add-mask::${value}`);
@@ -124,6 +127,9 @@ jobs:
             echo "E2E_USER_ID=$E2E_USER_ID"
             echo "E2E_USER_TOKEN=$E2E_USER_TOKEN"
             echo "E2E_MODEL_DEFINITION_ID=$E2E_MODEL_DEFINITION_ID"
+            echo "E2E_CONVERSATION_ID=$E2E_CONVERSATION_ID"
+            echo "E2E_PROJECT_ID=$E2E_PROJECT_ID"
+            echo "E2E_PLAN_REVISION=$E2E_PLAN_REVISION"
             echo 'E2E_ASSETS_JSON<<__SEEDANCE_ASSETS__'
             echo "$E2E_ASSETS_JSON"
             echo '__SEEDANCE_ASSETS__'
@@ -140,6 +146,11 @@ jobs:
               chatControlCredits: value.chatControlCredits,
               atomicFixtureCount: value.assets.length,
               imageProviderCalls: 0,
+              frozenByBusinessService: true,
+              planRevision: value.planRevision,
+              planVersion: value.planVersion,
+              contractHash: value.contractHash,
+              planModes: value.planModes,
             }, null, 2));
           ' > uat-artifacts/paid-protocol-preflight.json
 
