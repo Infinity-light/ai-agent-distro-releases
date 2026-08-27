@@ -13,6 +13,9 @@ on:
       request_key:
         description: Exact isolated chat request key to inspect
         required: true
+      event_time_utc:
+        description: Exact UTC time returned by the failed response
+        required: true
 
 permissions:
   contents: read
@@ -32,6 +35,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           REQUEST_ID: ${{ inputs.request_id }}
           REQUEST_KEY: ${{ inputs.request_key }}
+          EVENT_TIME_UTC: ${{ inputs.event_time_utc }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
@@ -41,6 +45,7 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$REQUEST_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
           [[ "$REQUEST_KEY" =~ ^seedance-protocol-paid:[0-9]+:[1-4]$ ]]
+          [[ "$EVENT_TIME_UTC" =~ ^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
           install -d -m 700 "$HOME/.ssh" diagnostic-artifacts
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
@@ -49,13 +54,14 @@ jobs:
           chmod 600 "$HOME/.ssh/known_hosts"
           request_id_b64=$(printf '%s' "$REQUEST_ID" | base64 -w0)
           request_key_b64=$(printf '%s' "$REQUEST_KEY" | base64 -w0)
+          event_time_b64=$(printf '%s' "$EVENT_TIME_UTC" | base64 -w0)
           sshpass -p "$SERVER_PASSWORD" ssh \
             -p "$SERVER_PORT" \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
-            "EXPECTED_RELEASE='$SOURCE_SHA' REQUEST_ID_B64='$request_id_b64' REQUEST_KEY_B64='$request_key_b64' bash -se" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' REQUEST_ID_B64='$request_id_b64' REQUEST_KEY_B64='$request_key_b64' EVENT_TIME_B64='$event_time_b64' bash -se" \
             > diagnostic-artifacts/request-error.json <<'REMOTE'
           set -Eeuo pipefail
           APP_ROOT=/opt/apps/zhiduoduo-platform
@@ -71,6 +77,31 @@ jobs:
           const expectedRelease = process.env.EXPECTED_RELEASE;
           const requestId = Buffer.from(process.env.REQUEST_ID_B64, 'base64').toString('utf8');
           const requestKey = Buffer.from(process.env.REQUEST_KEY_B64, 'base64').toString('utf8');
+          const eventTime = new Date(Buffer.from(process.env.EVENT_TIME_B64, 'base64').toString('utf8'));
+          if (Number.isNaN(eventTime.getTime())) throw new Error('Invalid event time');
+
+          function pad(value) {
+            return String(value).padStart(2, '0');
+          }
+
+          function minutePatterns(date) {
+            const utc = {
+              y: date.getUTCFullYear(), m: pad(date.getUTCMonth() + 1), d: pad(date.getUTCDate()),
+              h: pad(date.getUTCHours()), min: pad(date.getUTCMinutes()),
+            };
+            const china = new Date(date.getTime() + 8 * 60 * 60_000);
+            const cst = {
+              y: china.getUTCFullYear(), m: pad(china.getUTCMonth() + 1), d: pad(china.getUTCDate()),
+              h: pad(china.getUTCHours()), min: pad(china.getUTCMinutes()),
+            };
+            return [
+              `${utc.y}-${utc.m}-${utc.d}T${utc.h}:${utc.min}`,
+              `${utc.y}-${utc.m}-${utc.d} ${utc.h}:${utc.min}`,
+              `${cst.y}-${cst.m}-${cst.d}T${cst.h}:${cst.min}`,
+              `${cst.y}-${cst.m}-${cst.d} ${cst.h}:${cst.min}`,
+              `${Number(cst.m)}/${Number(cst.d)}/${cst.y}, ${cst.h}:${cst.min}`,
+            ];
+          }
 
           function tail(file, maxBytes = 16 * 1024 * 1024) {
             try {
@@ -108,11 +139,15 @@ jobs:
           } catch {}
 
           const matches = [];
+          const timePatterns = minutePatterns(eventTime);
           for (const file of files) {
             const lines = tail(file).split(/\r?\n/);
             const selected = new Set();
             lines.forEach((line, index) => {
-              if (!line.includes(requestId) && !line.includes(requestKey)) return;
+              const exactMatch = line.includes(requestId) || line.includes(requestKey);
+              const timedFailure = timePatterns.some((pattern) => line.includes(pattern))
+                && /error|exception|failed|failure|fatal|status=500/i.test(line);
+              if (!exactMatch && !timedFailure) return;
               for (let cursor = Math.max(0, index - 30); cursor <= Math.min(lines.length - 1, index + 30); cursor += 1) {
                 selected.add(cursor);
               }
@@ -129,6 +164,8 @@ jobs:
             release: expectedRelease,
             requestId,
             requestKey,
+            eventTimeUtc: eventTime.toISOString(),
+            timePatterns,
             matchedSources: matches.length,
             matches,
           }, null, 2));
