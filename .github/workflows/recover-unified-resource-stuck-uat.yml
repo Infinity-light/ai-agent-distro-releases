@@ -81,6 +81,13 @@ jobs:
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           path: source
 
+      - name: Initialize bounded recovery evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p recovery-artifacts
+          printf '%s\n' '{"status":"initialized","mutations":"none"}' > recovery-artifacts/recovery-state.json
+
       - name: Install protected SSH runtime
         shell: bash
         env:
@@ -181,7 +188,7 @@ jobs:
               prisma.tokenUsageLog.count({
                 where: { userId: { in: users.map((user) => user.id) }, businessType: { not: 'TEXT' } },
               }),
-              prisma.creditReservation.count({ where: { userId: { in: users.map((user) => user.id) } }),
+              prisma.creditReservation.count({ where: { userId: { in: users.map((user) => user.id) } } }),
             ]);
             assert(JSON.stringify(calls.map((call) => call.toolName)) === JSON.stringify(['resource_search', 'ask_user_question']), 'Recovered turn tool sequence drifted');
             assert(calls.every((call) => call.status === 'COMPLETED' && call.attempts === 1), 'Recovered turn re-executed or lost a tool terminal');
