@@ -79,13 +79,20 @@ jobs:
           if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
           printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          uat_json=$(sshpass -p "$SERVER_PASSWORD" ssh \
+          umask 077
+          E2E_SESSION_FILE="$RUNNER_TEMP/clickable-choice-session.json"
+          E2E_TOKEN_FILE="$RUNNER_TEMP/clickable-choice-token"
+          E2E_EXISTING_SESSION_FILE="$RUNNER_TEMP/clickable-choice-existing-session.json"
+          echo "E2E_SESSION_FILE=$E2E_SESSION_FILE" >> "$GITHUB_ENV"
+          echo "E2E_TOKEN_FILE=$E2E_TOKEN_FILE" >> "$GITHUB_ENV"
+          echo "E2E_EXISTING_SESSION_FILE=$E2E_EXISTING_SESSION_FILE" >> "$GITHUB_ENV"
+          sshpass -p "$SERVER_PASSWORD" ssh \
             -p "$SERVER_PORT" \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
-            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PHONE='$E2E_UAT_PHONE' bash -se" <<'REMOTE'
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PHONE='$E2E_UAT_PHONE' bash -se" > "$E2E_SESSION_FILE" <<'REMOTE'
           set -Eeuo pipefail
           APP_ROOT=/opt/apps/zhiduoduo-platform
           ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
@@ -157,12 +164,102 @@ jobs:
           })().finally(() => prisma.$disconnect());
           NODE
           REMOTE
-          )
-          E2E_USER_ID=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).userId)')
-          E2E_TOKEN=$(UAT_JSON="$uat_json" node -e 'process.stdout.write(JSON.parse(process.env.UAT_JSON).token)')
-          echo "::add-mask::$E2E_TOKEN"
+          chmod 600 "$E2E_SESSION_FILE"
+          SESSION_FILE="$E2E_SESSION_FILE" TOKEN_FILE="$E2E_TOKEN_FILE" node <<'NODE'
+          const fs = require('node:fs');
+          const session = JSON.parse(fs.readFileSync(process.env.SESSION_FILE, 'utf8'));
+          if (!session.userId || !session.token) throw new Error('Synthetic session handoff is incomplete');
+          fs.writeFileSync(process.env.TOKEN_FILE, session.token, { mode: 0o600 });
+          fs.chmodSync(process.env.TOKEN_FILE, 0o600);
+          NODE
+          E2E_USER_ID=$(SESSION_FILE="$E2E_SESSION_FILE" node -e "const fs=require('node:fs');process.stdout.write(JSON.parse(fs.readFileSync(process.env.SESSION_FILE,'utf8')).userId)")
           echo "E2E_USER_ID=$E2E_USER_ID" >> "$GITHUB_ENV"
-          echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
+
+          sshpass -p "$SERVER_PASSWORD" ssh \
+            -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "EXPECTED_RELEASE='$SOURCE_SHA' bash -se" > "$E2E_EXISTING_SESSION_FILE" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_ROOT=/opt/apps/zhiduoduo-platform
+          ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
+          test "$(basename "$ACTIVE_RELEASE")" = "$EXPECTED_RELEASE"
+          cd "$ACTIVE_RELEASE"
+          node --env-file="$APP_ROOT/shared/.env" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const jwt = require('jsonwebtoken');
+          const prisma = new PrismaClient();
+          const sourceMessageId = '09dfbd28-dd73-43f5-847d-29de2a8a83e3';
+          const sourceEventId = 'b319d457-c2c7-4e04-8d8a-8efaf33d72ce:tool:call_13016461813a4677ace75ea2';
+          (async () => {
+            const source = await prisma.aiMessage.findUnique({
+              where: { id: sourceMessageId },
+              select: {
+                id: true,
+                conversationId: true,
+                conversation: {
+                  select: {
+                    user: { select: { id: true, phone: true, role: true, sessionVersion: true } },
+                    messages: { select: { role: true, attachments: true } },
+                  },
+                },
+              },
+            });
+            if (!source) throw new Error('Bound source message is missing');
+            const receipts = source.conversation.messages.flatMap((message) => (
+              message.role === 'user' && Array.isArray(message.attachments)
+                ? message.attachments.filter((attachment) => attachment?.type === 'choice_input'
+                  && attachment.sourceMessageId === sourceMessageId)
+                : []
+            ));
+            if (receipts.length !== 1) throw new Error(`Expected one trusted receipt, found ${receipts.length}`);
+            if (receipts[0].sourceEventId !== sourceEventId) throw new Error('Trusted receipt source event drifted');
+            const user = source.conversation.user;
+            const token = jwt.sign(
+              { sub: user.id, phone: user.phone, role: user.role, sessionVersion: user.sessionVersion },
+              process.env.JWT_SECRET,
+              { expiresIn: '45m' },
+            );
+            console.log(JSON.stringify({
+              token,
+              userId: user.id,
+              conversationId: source.conversationId,
+              internalAudit: { receiptCount: receipts.length, sourceMessageBound: true, sourceEventBound: true },
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          REMOTE
+          chmod 600 "$E2E_EXISTING_SESSION_FILE"
+
+      - name: Verify protected handoff and trusted receipt boundary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(stat -c '%a' "$E2E_TOKEN_FILE")" = '600'
+          test "$(stat -c '%a' "$E2E_EXISTING_SESSION_FILE")" = '600'
+          mkdir -p uat-artifacts
+          EXISTING_SESSION_FILE="$E2E_EXISTING_SESSION_FILE" node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const binding = JSON.parse(fs.readFileSync(process.env.EXISTING_SESSION_FILE, 'utf8'));
+          if (!binding.token || !binding.userId || !binding.conversationId) throw new Error('Existing session binding is incomplete');
+          if (binding.internalAudit?.receiptCount !== 1
+            || binding.internalAudit?.sourceMessageBound !== true
+            || binding.internalAudit?.sourceEventBound !== true) {
+            throw new Error('Trusted internal receipt audit failed');
+          }
+          const ref = (value) => crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+          fs.writeFileSync('uat-artifacts/trusted-internal-choice-audit.json', `${JSON.stringify({
+            status: 'passed',
+            conversationRef: ref(binding.conversationId),
+            receiptCount: 1,
+            sourceMessageBound: true,
+            sourceEventBound: true,
+            publicCredentialFields: 0,
+          }, null, 2)}\n`);
+          NODE
 
       - name: Run real production clickable-choice UAT
         env:
@@ -172,15 +269,6 @@ jobs:
           NODE_PATH: ${{ github.workspace }}/runtime/node_modules
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
         run: node source/.github/e2e/production-clickable-choice.cjs
-
-      - name: Upload production UAT evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: clickable-choice-production-uat-${{ inputs.source_sha }}
-          path: uat-artifacts/
-          if-no-files-found: error
-          retention-days: 30
 
       - name: Remove isolated UAT user
         if: always()
@@ -194,16 +282,18 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [ -z "${E2E_UAT_PHONE:-}" ]; then
-            echo 'No UAT identity was allocated; cleanup is unnecessary.'
+            mkdir -p uat-artifacts
+            printf '%s\n' '{"removedScopedUatUsers":0,"residualScopedUatUsers":0}' > uat-artifacts/cleanup.json
             exit 0
           fi
+          mkdir -p uat-artifacts
           sshpass -p "$SERVER_PASSWORD" ssh \
             -p "$SERVER_PORT" \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" \
-            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_USER_ID='${E2E_USER_ID:-}' E2E_UAT_PHONE='$E2E_UAT_PHONE' bash -se" <<'REMOTE'
+            "EXPECTED_RELEASE='$SOURCE_SHA' E2E_USER_ID='${E2E_USER_ID:-}' E2E_UAT_PHONE='$E2E_UAT_PHONE' bash -se" > uat-artifacts/cleanup.json <<'REMOTE'
           set -Eeuo pipefail
           APP_ROOT=/opt/apps/zhiduoduo-platform
           ACTIVE_RELEASE=$(readlink -f "$APP_ROOT/current")
@@ -221,7 +311,10 @@ jobs:
             if (users.length > 20) throw new Error('Refusing to remove more than 20 scoped UAT users');
             if (users.some((user) => !user.phone.startsWith(scopedPrefix))) throw new Error('UAT cleanup escaped its phone prefix');
             const userIds = users.map((user) => user.id);
-            if (!userIds.length) return;
+            if (!userIds.length) {
+              console.log(JSON.stringify({ removedScopedUatUsers: 0, residualScopedUatUsers: 0 }));
+              return;
+            }
             await prisma.$transaction([
               prisma.businessProfile.deleteMany({ where: { userId: { in: userIds } } }),
               prisma.creditReservation.deleteMany({ where: { userId: { in: userIds } } }),
@@ -235,10 +328,33 @@ jobs:
               prisma.feedback.deleteMany({ where: { userId: { in: userIds } } }),
               prisma.user.deleteMany({ where: { id: { in: userIds }, phone: { startsWith: scopedPrefix } } }),
             ]);
-            console.log(JSON.stringify({ removedScopedUatUsers: users.length }));
+            const residual = await prisma.user.count({ where: { phone: { startsWith: scopedPrefix } } });
+            if (residual !== 0) throw new Error(`Scoped clickable-choice UAT users remain: ${residual}`);
+            console.log(JSON.stringify({ removedScopedUatUsers: users.length, residualScopedUatUsers: residual }));
           })().finally(() => prisma.$disconnect());
           NODE
           REMOTE
+
+      - name: Destroy protected session handoff
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for protected_file in "${E2E_TOKEN_FILE:-}" "${E2E_EXISTING_SESSION_FILE:-}" "${E2E_SESSION_FILE:-}"; do
+            if [ -n "$protected_file" ]; then
+              rm -f -- "$protected_file"
+              test ! -e "$protected_file"
+            fi
+          done
+
+      - name: Upload production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: clickable-choice-production-uat-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Record production clickable-choice acceptance
         run: |
