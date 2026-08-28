@@ -1,0 +1,257 @@
+name: Diagnose Unified Resource Stuck Turn
+run-name: "diagnose resource stuck-turn ${{ inputs.uat_run_id }} [active-${{ inputs.active_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      active_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run for active_sha
+        required: true
+      uat_run_id:
+        description: Failed unified-resource UAT run to diagnose
+        required: true
+      uat_run_attempt:
+        description: Exact failed UAT run attempt used in the synthetic namespace
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate active deployment and failed UAT binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          UAT_RUN_ID: ${{ inputs.uat_run_id }}
+          UAT_RUN_ATTEMPT: ${{ inputs.uat_run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ACTIVE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$UAT_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$UAT_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          release=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          uat=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$UAT_RUN_ID")
+          RELEASE="$release" UAT="$uat" node - <<'NODE'
+          const release = JSON.parse(process.env.RELEASE);
+          const uat = JSON.parse(process.env.UAT);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(release.status === 'completed' && release.conclusion === 'success', 'Bound deployment is not successful');
+          assert(String(release.display_title || release.name).includes(process.env.ACTIVE_SHA), 'Deployment is not bound to active SHA');
+          assert(uat.status === 'completed' && uat.conclusion === 'failure', 'Bound UAT is not a completed failed run');
+          assert(String(uat.path || '').includes('verify-unified-resource-protocol.yml'), 'Run is not the unified-resource UAT');
+          assert(String(uat.display_title || uat.name).includes(process.env.ACTIVE_SHA), 'UAT is not bound to active SHA');
+          assert(Number(uat.run_attempt) === Number(process.env.UAT_RUN_ATTEMPT), 'UAT attempt binding drifted');
+          NODE
+
+      - name: Install protected SSH runtime
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-resource-turn-diagnostic-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-resource-turn-diagnostic-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-resource-turn-diagnostic:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Collect bounded read-only turn evidence
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          UAT_RUN_ID: ${{ inputs.uat_run_id }}
+          UAT_RUN_ATTEMPT: ${{ inputs.uat_run_attempt }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p diagnostic-artifacts
+          UAT_PREFIX="resource-protocol-uat-${UAT_RUN_ID}-${UAT_RUN_ATTEMPT}"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$ACTIVE_SHA' E2E_UAT_PREFIX='$UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+          const iso = (value) => value ? new Date(value).toISOString() : null;
+          const safeCode = (value) => typeof value === 'string' && /^[A-Z][A-Z0-9_.:-]{1,119}$/u.test(value) ? value : null;
+          const safeToolNames = (value) => Array.isArray(value)
+            ? value.map((item) => typeof item === 'string' ? item : item?.name)
+              .filter((item) => typeof item === 'string' && /^[a-z][a-z0-9_]{1,79}$/u.test(item))
+            : [];
+
+          (async () => {
+            const prefix = process.env.E2E_UAT_PREFIX || '';
+            if (!/^resource-protocol-uat-[0-9]+-[1-9][0-9]*$/u.test(prefix)) throw new Error('Diagnostic scope is invalid');
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: prefix } },
+              select: { id: true },
+            });
+            if (users.length < 1 || users.length > 2) throw new Error('Diagnostic account scope is not exactly bounded');
+            const requests = await prisma.aiChatRequest.findMany({
+              where: { userId: { in: users.map((user) => user.id) } },
+              select: {
+                id: true, status: true, errorCode: true, retryable: true, billingStatus: true,
+                agentSessionId: true, turnId: true, createdAt: true, updatedAt: true,
+                sideEffectStartedAt: true, completedAt: true, failedAt: true, cancelledAt: true,
+              },
+              orderBy: { createdAt: 'asc' },
+            });
+            if (requests.length > 4) throw new Error('Diagnostic request scope exceeded four rows');
+            const sessionIds = [...new Set(requests.map((request) => request.agentSessionId).filter(Boolean))];
+            const sessions = sessionIds.length ? await prisma.agentSession.findMany({
+              where: { id: { in: sessionIds } },
+              select: { id: true, status: true, activeTurnId: true, activeTurnStartedAt: true, updatedAt: true },
+            }) : [];
+            const turnPairs = new Set(requests.map((request) => `${request.agentSessionId || ''}:${request.turnId}`));
+            const events = sessionIds.length ? (await prisma.agentEvent.findMany({
+              where: { sessionId: { in: sessionIds } },
+              select: { sessionId: true, turnId: true, sequence: true, type: true, requestId: true, payload: true, createdAt: true },
+              orderBy: [{ sessionId: 'asc' }, { sequence: 'asc' }],
+            })).filter((event) => turnPairs.has(`${event.sessionId}:${event.turnId || ''}`)) : [];
+            if (events.length > 100) throw new Error('Diagnostic Agent event scope exceeded 100 rows');
+            const calls = sessionIds.length ? await prisma.agentCall.findMany({
+              where: { sessionId: { in: sessionIds } },
+              select: { sessionId: true, turnId: true, toolName: true, status: true, attempts: true, requestedAt: true, completedAt: true },
+              orderBy: { requestedAt: 'asc' },
+            }) : [];
+            const publicEvents = requests.length ? await prisma.aiChatEvent.findMany({
+              where: { requestId: { in: requests.map((request) => request.id) } },
+              select: { requestId: true, sequence: true, type: true, createdAt: true },
+              orderBy: [{ requestId: 'asc' }, { sequence: 'asc' }],
+            }) : [];
+            const conversationIds = await prisma.aiConversation.findMany({
+              where: { userId: { in: users.map((user) => user.id) } },
+              select: { id: true },
+            });
+            const ownerCount = conversationIds.length ? await prisma.aiChatPublicEventOwner.count({
+              where: { conversationId: { in: conversationIds.map((conversation) => conversation.id) } },
+            }) : 0;
+            console.log(JSON.stringify({
+              diagnostic: 'passed',
+              mutations: 'none',
+              release: process.env.EXPECTED_RELEASE,
+              scopeHash: hash(prefix),
+              accountCount: users.length,
+              ownerCount,
+              requests: requests.map((request) => ({
+                requestHash: hash(request.id),
+                sessionHash: hash(request.agentSessionId),
+                turnHash: hash(request.turnId),
+                status: request.status,
+                errorCode: safeCode(request.errorCode),
+                retryable: request.retryable,
+                billingStatus: request.billingStatus,
+                sideEffectStarted: Boolean(request.sideEffectStartedAt),
+                createdAt: iso(request.createdAt), updatedAt: iso(request.updatedAt),
+                completedAt: iso(request.completedAt), failedAt: iso(request.failedAt), cancelledAt: iso(request.cancelledAt),
+              })),
+              sessions: sessions.map((session) => ({
+                sessionHash: hash(session.id), status: session.status,
+                activeTurnHash: hash(session.activeTurnId),
+                activeTurnStartedAt: iso(session.activeTurnStartedAt), updatedAt: iso(session.updatedAt),
+              })),
+              events: events.map((event) => ({
+                sessionHash: hash(event.sessionId), turnHash: hash(event.turnId), sequence: event.sequence,
+                type: event.type, requestBound: Boolean(event.requestId), createdAt: iso(event.createdAt),
+                round: Number.isInteger(event.payload?.round) ? event.payload.round : null,
+                code: safeCode(event.payload?.code),
+                toolNames: safeToolNames(event.payload?.toolNames || event.payload?.toolCalls),
+              })),
+              calls: calls.map((call) => ({
+                sessionHash: hash(call.sessionId), turnHash: hash(call.turnId), toolName: call.toolName,
+                status: call.status, attempts: call.attempts,
+                requestedAt: iso(call.requestedAt), completedAt: iso(call.completedAt),
+              })),
+              publicEvents: publicEvents.map((event) => ({
+                requestHash: hash(event.requestId), sequence: event.sequence, type: event.type, createdAt: iso(event.createdAt),
+              })),
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          report=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$report" | tee diagnostic-artifacts/resource-stuck-turn-readonly.json
+          REPORT="$report" node -e '
+            const report = JSON.parse(process.env.REPORT);
+            if (report.diagnostic !== "passed" || report.mutations !== "none") throw new Error("Read-only diagnostic boundary failed");
+          '
+
+      - name: Enforce diagnostic artifact privacy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          root = pathlib.Path('diagnostic-artifacts')
+          jwt = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+          connection = re.compile(rb'postgres(?:ql)?://[^:/\s]+:[^@/\s]+@', re.I)
+          protected_keys = re.compile(rb'"(?:token|jwt|jwtSecret|authorization|databaseUrl|credential)"\s*:', re.I)
+          for item in root.rglob('*'):
+              if not item.is_file():
+                  continue
+              data = item.read_bytes()
+              if jwt.search(data) or connection.search(data) or protected_keys.search(data):
+                  raise SystemExit(f'protected credential material detected in {item.name}')
+          print('artifact_privacy_gate=passed')
+          PY
+
+      - name: Upload bounded read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unified-resource-stuck-turn-readonly-${{ inputs.uat_run_id }}
+          path: diagnostic-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record read-only boundary
+        run: |
+          echo 'unified_resource_stuck_turn_diagnostic=passed'
+          echo 'mutations=none'
+          echo 'active_sha=${{ inputs.active_sha }}'
