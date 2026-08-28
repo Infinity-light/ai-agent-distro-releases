@@ -1,0 +1,205 @@
+name: Diagnose Unified Resource Owner Orphans
+run-name: "diagnose resource-owner orphans [active-${{ inputs.active_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      active_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run for active_sha
+        required: true
+      first_uat_run_id:
+        description: First unified-resource UAT run to correlate
+        required: true
+      second_uat_run_id:
+        description: Second unified-resource UAT run to correlate
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate active deployment and bounded UAT runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          FIRST_UAT_RUN_ID: ${{ inputs.first_uat_run_id }}
+          SECOND_UAT_RUN_ID: ${{ inputs.second_uat_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ACTIVE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$FIRST_UAT_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$SECOND_UAT_RUN_ID" =~ ^[0-9]+$ ]]
+          release=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          first=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$FIRST_UAT_RUN_ID")
+          second=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$SECOND_UAT_RUN_ID")
+          RELEASE="$release" FIRST="$first" SECOND="$second" node - <<'NODE'
+          const release = JSON.parse(process.env.RELEASE);
+          const runs = [JSON.parse(process.env.FIRST), JSON.parse(process.env.SECOND)];
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(release.status === 'completed' && release.conclusion === 'success', 'Bound deployment is not successful');
+          assert(String(release.display_title || release.name).includes(process.env.ACTIVE_SHA), 'Deployment is not bound to active SHA');
+          for (const run of runs) {
+            assert(run.status === 'completed' && run.conclusion === 'failure', 'Bound UAT is not a completed failed run');
+            assert(String(run.path || '').includes('verify-unified-resource-protocol.yml'), 'Run is not the unified-resource UAT');
+            assert(String(run.display_title || run.name).includes(process.env.ACTIVE_SHA), 'UAT run is not bound to active SHA');
+          }
+          NODE
+
+      - name: Install protected SSH runtime
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-owner-diagnostic-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-owner-diagnostic-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-owner-diagnostic:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Collect read-only orphan identity evidence
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p diagnostic-artifacts
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$ACTIVE_SHA' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+
+          (async () => {
+            const rows = await prisma.$queryRawUnsafe(`
+              WITH raw AS MATERIALIZED (
+                SELECT e.id, e.payload -> 'mutation' AS mutation
+                FROM ai_chat_events e
+                WHERE e.type = 'conversation_event'
+              ), parsed AS MATERIALIZED (
+                SELECT raw.*,
+                  CASE WHEN jsonb_typeof(mutation -> 'sequence') = 'number'
+                    THEN (mutation ->> 'sequence')::NUMERIC END AS sequence_numeric
+                FROM raw WHERE jsonb_typeof(mutation) = 'object'
+              ), candidates AS MATERIALIZED (
+                SELECT id,
+                  mutation ->> 'conversationId' AS conversation_id,
+                  CASE WHEN sequence_numeric = trunc(sequence_numeric)
+                        AND sequence_numeric BETWEEN 1 AND 2147483647
+                    THEN sequence_numeric::INTEGER END AS domain_sequence,
+                  mutation ->> 'eventId' AS event_id,
+                  mutation ->> 'turnId' AS turn_id,
+                  mutation ->> 'kind' AS kind
+                FROM parsed
+                WHERE jsonb_typeof(mutation -> 'conversationId') = 'string'
+                  AND length(btrim(mutation ->> 'conversationId')) > 0
+                  AND jsonb_typeof(mutation -> 'eventId') = 'string'
+                  AND length(btrim(mutation ->> 'eventId')) > 0
+                  AND jsonb_typeof(mutation -> 'turnId') = 'string'
+                  AND length(btrim(mutation ->> 'turnId')) > 0
+                  AND jsonb_typeof(mutation -> 'kind') = 'string'
+                  AND mutation ->> 'kind' IN (
+                    'user_text', 'assistant_text', 'skill', 'tool', 'video_quote',
+                    'choice', 'error', 'creative_artifact', 'interaction', 'unknown'
+                  )
+              ), valid AS MATERIALIZED (
+                SELECT * FROM candidates WHERE domain_sequence IS NOT NULL
+              )
+              SELECT o."conversationId", o."domainSequence", o."eventId", o."turnId", o.kind, o."createdAt",
+                NOT EXISTS (SELECT 1 FROM ai_conversations c WHERE c.id = o."conversationId") AS "conversationMissing"
+              FROM ai_chat_public_event_owners o
+              WHERE NOT EXISTS (
+                SELECT 1 FROM valid v
+                WHERE o."conversationId" = v.conversation_id
+                  AND o."domainSequence" = v.domain_sequence
+                  AND o."eventId" = v.event_id
+                  AND o."turnId" = v.turn_id
+                  AND o.kind = v.kind
+              )
+              ORDER BY o."createdAt", o."conversationId", o."domainSequence"
+            `);
+            if (rows.length > 20) throw new Error('Orphan set exceeds the bounded diagnostic limit');
+            console.log(JSON.stringify({
+              diagnostic: 'passed',
+              mutations: 'none',
+              release: process.env.EXPECTED_RELEASE,
+              mismatchCount: rows.length,
+              rows: rows.map((row) => ({
+                conversationHash: hash(row.conversationId),
+                eventHash: hash(row.eventId),
+                turnHash: hash(row.turnId),
+                domainSequence: row.domainSequence,
+                kind: row.kind,
+                createdAt: new Date(row.createdAt).toISOString(),
+                conversationMissing: row.conversationMissing === true,
+              })),
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          report=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$report" | tee diagnostic-artifacts/owner-orphans-readonly.json
+          REPORT="$report" node -e '
+            const report = JSON.parse(process.env.REPORT);
+            if (report.diagnostic !== "passed" || report.mutations !== "none") throw new Error("Read-only diagnostic boundary failed");
+          '
+
+      - name: Upload bounded read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unified-resource-owner-orphans-readonly-${{ inputs.active_sha }}
+          path: diagnostic-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record read-only boundary
+        run: |
+          echo 'unified_resource_owner_orphan_diagnostic=passed'
+          echo 'mutations=none'
+          echo 'active_sha=${{ inputs.active_sha }}'
