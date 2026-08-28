@@ -58,7 +58,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p runtime
-          npm install --prefix runtime --no-package-lock --no-save playwright@1.55.1
+          npm install --prefix runtime --no-package-lock --no-save @playwright/test@1.55.1
           PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./runtime/node_modules/.bin/playwright install --with-deps chromium
 
       - name: Create isolated activated UAT session
