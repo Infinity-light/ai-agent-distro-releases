@@ -141,6 +141,135 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
         run: E2E_CREDENTIAL_FILE="$RUNNER_CREDENTIAL_FILE" node source/.github/e2e/production-unified-resource-protocol.cjs
 
+      - name: Collect bounded failure diagnostics before cleanup
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '%s\n' '{"diagnostics":"not-required","reason":"scope-not-allocated"}' | tee uat-artifacts/failure-diagnostics.json
+            exit 0
+          fi
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+          const safeCode = (value) => typeof value === 'string' && /^[A-Z][A-Z0-9_.:-]{1,119}$/u.test(value)
+            ? value
+            : null;
+          const safeToolNames = (value) => Array.isArray(value)
+            ? value.map((item) => typeof item === 'string' ? item : item?.name).filter((item) => (
+                typeof item === 'string' && /^[a-z][a-z0-9_]{1,79}$/u.test(item)
+              ))
+            : [];
+
+          (async () => {
+            const prefix = process.env.E2E_UAT_PREFIX || '';
+            if (!/^resource-protocol-uat-[0-9-]+$/u.test(prefix)) throw new Error('Diagnostic scope is invalid');
+            const users = await prisma.user.findMany({
+              where: { phone: { startsWith: prefix } },
+              select: { id: true },
+            });
+            if (users.length > 2) throw new Error('Diagnostic scope escaped the two-account namespace');
+            const userIds = users.map((user) => user.id);
+            const requests = userIds.length ? await prisma.aiChatRequest.findMany({
+              where: { userId: { in: userIds } },
+              select: {
+                id: true,
+                status: true,
+                errorCode: true,
+                retryable: true,
+                billingStatus: true,
+                agentSessionId: true,
+                turnId: true,
+              },
+              orderBy: { createdAt: 'asc' },
+            }) : [];
+            const sessionIds = [...new Set(requests.map((request) => request.agentSessionId).filter(Boolean))];
+            const calls = sessionIds.length ? await prisma.agentCall.findMany({
+              where: { sessionId: { in: sessionIds } },
+              select: { sessionId: true, turnId: true, toolName: true, status: true, attempts: true, result: true },
+              orderBy: { requestedAt: 'asc' },
+            }) : [];
+            const events = requests.length ? await prisma.agentEvent.findMany({
+              where: { requestId: { in: requests.map((request) => request.id) } },
+              select: { requestId: true, type: true, payload: true, sequence: true },
+              orderBy: [{ requestId: 'asc' }, { sequence: 'asc' }],
+            }) : [];
+            const runtime = await prisma.agentRuntimeState.findUnique({
+              where: { id: 'zhiduoduo' },
+              select: { status: true, error: true, activeSnapshotId: true },
+            });
+            const active = runtime?.activeSnapshotId ? await prisma.agentRuntimeSnapshot.findUnique({
+              where: { id: runtime.activeSnapshotId },
+              select: { snapshot: true, status: true },
+            }) : null;
+            const capabilities = Array.isArray(active?.snapshot?.capabilities) ? active.snapshot.capabilities : [];
+            const diagnosticEvents = events
+              .filter((event) => ['model.requested', 'model.completed', 'model.failed', 'model.output.rejected', 'model.output.suppressed', 'turn.failed'].includes(event.type))
+              .map((event) => ({
+                requestHash: hash(event.requestId),
+                sequence: event.sequence,
+                type: event.type,
+                round: Number.isInteger(event.payload?.round) ? event.payload.round : null,
+                code: safeCode(event.payload?.code),
+                toolNames: safeToolNames(event.payload?.toolNames || event.payload?.toolCalls),
+              }));
+            const report = {
+              diagnostics: 'collected',
+              scopeHash: hash(prefix),
+              accountCount: users.length,
+              requests: requests.map((request) => ({
+                requestHash: hash(request.id),
+                turnHash: hash(request.turnId),
+                status: request.status,
+                errorCode: safeCode(request.errorCode),
+                retryable: request.retryable,
+                billingStatus: request.billingStatus,
+              })),
+              calls: calls.map((call) => ({
+                sessionHash: hash(call.sessionId),
+                turnHash: hash(call.turnId),
+                toolName: call.toolName,
+                status: call.status,
+                attempts: call.attempts,
+                success: typeof call.result?.success === 'boolean' ? call.result.success : null,
+                code: safeCode(call.result?.code),
+              })),
+              events: diagnosticEvents,
+              runtime: {
+                state: runtime?.status || 'MISSING',
+                errorCode: safeCode(runtime?.error?.code),
+                snapshotStatus: active?.status || 'MISSING',
+                resourceTools: capabilities
+                  .filter((item) => item?.kind === 'tool' && typeof item.id === 'string' && item.id.startsWith('resource_'))
+                  .map((item) => item.id)
+                  .sort(),
+              },
+            };
+            console.log(JSON.stringify(report));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          diagnostic=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$diagnostic" | tee uat-artifacts/failure-diagnostics.json
+          DIAGNOSTIC_JSON="$diagnostic" node -e '
+            const report = JSON.parse(process.env.DIAGNOSTIC_JSON);
+            if (report.diagnostics !== "collected") throw new Error("Bounded production diagnostics failed");
+          '
+
       - name: Collect private ledger invariants as redacted evidence
         shell: bash
         env:
