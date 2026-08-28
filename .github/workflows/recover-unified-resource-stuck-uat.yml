@@ -1,0 +1,298 @@
+name: Recover Unified Resource Stuck UAT
+run-name: "recover resource stuck-uat ${{ inputs.failed_uat_run_id }} [active-${{ inputs.active_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      active_sha:
+        description: Current immutable production release SHA containing the fix
+        required: true
+      release_run_id:
+        description: Bound successful deployment run for active_sha
+        required: true
+      failed_uat_sha:
+        description: Immutable SHA used by the failed synthetic UAT
+        required: true
+      failed_uat_run_id:
+        description: Failed unified-resource UAT run to clean
+        required: true
+      diagnostic_run_id:
+        description: Successful bounded read-only stuck-turn diagnostic run
+        required: true
+      uat_run_attempt:
+        description: Exact failed UAT attempt in the synthetic namespace
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate fixed release and failed UAT provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          FAILED_UAT_SHA: ${{ inputs.failed_uat_sha }}
+          FAILED_UAT_RUN_ID: ${{ inputs.failed_uat_run_id }}
+          DIAGNOSTIC_RUN_ID: ${{ inputs.diagnostic_run_id }}
+          UAT_RUN_ATTEMPT: ${{ inputs.uat_run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ACTIVE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FAILED_UAT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          for id in "$RELEASE_RUN_ID" "$FAILED_UAT_RUN_ID" "$DIAGNOSTIC_RUN_ID"; do [[ "$id" =~ ^[0-9]+$ ]]; done
+          [[ "$UAT_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          release=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          uat=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$FAILED_UAT_RUN_ID")
+          diagnostic=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$DIAGNOSTIC_RUN_ID")
+          RELEASE="$release" UAT="$uat" DIAGNOSTIC="$diagnostic" node - <<'NODE'
+          const release = JSON.parse(process.env.RELEASE);
+          const uat = JSON.parse(process.env.UAT);
+          const diagnostic = JSON.parse(process.env.DIAGNOSTIC);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(release.status === 'completed' && release.conclusion === 'success', 'Fixed deployment is not successful');
+          assert(String(release.display_title || release.name).includes(process.env.ACTIVE_SHA), 'Fixed deployment is not SHA-bound');
+          assert(uat.status === 'completed' && uat.conclusion === 'failure', 'Bound UAT is not the completed failed run');
+          assert(String(uat.path || '').includes('verify-unified-resource-protocol.yml'), 'UAT provenance is wrong');
+          assert(String(uat.display_title || uat.name).includes(process.env.FAILED_UAT_SHA), 'Failed UAT SHA binding drifted');
+          assert(Number(uat.run_attempt) === Number(process.env.UAT_RUN_ATTEMPT), 'Failed UAT attempt binding drifted');
+          assert(diagnostic.status === 'completed' && diagnostic.conclusion === 'success', 'Read-only diagnostic did not pass');
+          assert(String(diagnostic.path || '').includes('diagnose-unified-resource-stuck-turn.yml'), 'Diagnostic provenance is wrong');
+          assert(String(diagnostic.display_title || diagnostic.name).includes(process.env.FAILED_UAT_RUN_ID), 'Diagnostic is not bound to failed UAT');
+          assert(String(diagnostic.display_title || diagnostic.name).includes(process.env.FAILED_UAT_SHA), 'Diagnostic is not bound to failed UAT SHA');
+          NODE
+
+      - name: Checkout exact fixed source and cleanup harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.active_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install protected SSH runtime
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-resource-stuck-recovery-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-resource-stuck-recovery-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 900s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-resource-stuck-recovery:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify immutable recorded completion recovered without re-execution
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          FAILED_UAT_RUN_ID: ${{ inputs.failed_uat_run_id }}
+          UAT_RUN_ATTEMPT: ${{ inputs.uat_run_attempt }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p recovery-artifacts
+          UAT_PREFIX="resource-protocol-uat-${FAILED_UAT_RUN_ID}-${UAT_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$UAT_PREFIX" >> "$GITHUB_ENV"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; E2E_UAT_PREFIX='$UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const hash = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+
+          (async () => {
+            const prefix = process.env.E2E_UAT_PREFIX || '';
+            assert(/^resource-protocol-uat-[0-9]+-[1-9][0-9]*$/u.test(prefix), 'Recovery scope is invalid');
+            const deadline = Date.now() + 3 * 60 * 1000;
+            let users = [];
+            let requests = [];
+            while (Date.now() < deadline) {
+              users = await prisma.user.findMany({ where: { phone: { startsWith: prefix } }, select: { id: true } });
+              assert(users.length === 2, 'Recovery scope is not exactly two synthetic accounts');
+              requests = await prisma.aiChatRequest.findMany({
+                where: { userId: { in: users.map((user) => user.id) } },
+                select: {
+                  id: true, status: true, billingStatus: true, sideEffectStartedAt: true,
+                  agentSessionId: true, turnId: true,
+                },
+              });
+              assert(requests.length === 1, 'Recovery scope is not exactly one synthetic Chat request');
+              if (requests[0].status === 'COMPLETED' && ['COMPLETED', 'NOT_REQUIRED'].includes(requests[0].billingStatus)) break;
+              await sleep(1000);
+            }
+            const request = requests[0];
+            assert(request.status === 'COMPLETED', 'Recorded completion recovery did not terminalize the synthetic request');
+            assert(['COMPLETED', 'NOT_REQUIRED'].includes(request.billingStatus), 'Recovered request billing did not reach a safe terminal');
+            assert(!request.sideEffectStartedAt, 'Synthetic clarification unexpectedly crossed a side-effect boundary');
+            const [calls, events, nonTextUsageCount, reservationCount] = await Promise.all([
+              prisma.agentCall.findMany({
+                where: { sessionId: request.agentSessionId, turnId: request.turnId },
+                select: { toolName: true, status: true, attempts: true },
+                orderBy: { requestedAt: 'asc' },
+              }),
+              prisma.agentEvent.findMany({
+                where: { sessionId: request.agentSessionId, turnId: request.turnId },
+                select: { type: true },
+              }),
+              prisma.tokenUsageLog.count({
+                where: { userId: { in: users.map((user) => user.id) }, businessType: { not: 'TEXT' } },
+              }),
+              prisma.creditReservation.count({ where: { userId: { in: users.map((user) => user.id) } }),
+            ]);
+            assert(JSON.stringify(calls.map((call) => call.toolName)) === JSON.stringify(['resource_search', 'ask_user_question']), 'Recovered turn tool sequence drifted');
+            assert(calls.every((call) => call.status === 'COMPLETED' && call.attempts === 1), 'Recovered turn re-executed or lost a tool terminal');
+            assert(events.filter((event) => event.type === 'model.requested').length === 2, 'Recovered turn re-entered or lost Provider execution');
+            assert(events.filter((event) => event.type === 'turn.execution.completed').length === 1, 'Recovered turn execution checkpoint drifted');
+            assert(nonTextUsageCount === 0 && reservationCount === 0, 'Recovered clarification created non-text usage or a reservation');
+            console.log(JSON.stringify({
+              recoveryPreflight: 'passed', mutations: 'none', scopeHash: hash(prefix), accountCount: users.length,
+              requestHash: hash(request.id), requestStatus: request.status, billingStatus: request.billingStatus,
+              toolNames: calls.map((call) => call.toolName), modelRequestCount: 2,
+              executionCompletedCount: 1, nonTextUsageCount, reservationCount,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          preflight=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$preflight" | tee recovery-artifacts/recovery-preflight.json
+          PREFLIGHT="$preflight" node -e '
+            const value = JSON.parse(process.env.PREFLIGHT);
+            if (value.recoveryPreflight !== "passed" || value.mutations !== "none") throw new Error("Recovery preflight failed");
+          '
+
+      - name: Remove exact synthetic scope and destroy protected server credential
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          FAILED_UAT_RUN_ID: ${{ inputs.failed_uat_run_id }}
+          UAT_RUN_ATTEMPT: ${{ inputs.uat_run_attempt }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          SERVER_CREDENTIAL_FILE="/tmp/zhiduoduo-resource-uat-${FAILED_UAT_RUN_ID}-${UAT_RUN_ATTEMPT}.json"
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; E2E_UAT_PREFIX='$E2E_UAT_PREFIX' E2E_CREDENTIAL_FILE='$SERVER_CREDENTIAL_FILE' node --env-file=\"\$APP_ROOT/shared/.env\" -" \
+            < source/.github/e2e/production-unified-resource-protocol-cleanup.cjs)
+          cleanup=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$cleanup" | tee recovery-artifacts/cleanup.json
+          CLEANUP="$cleanup" node -e '
+            const value = JSON.parse(process.env.CLEANUP);
+            if (value.cleanup !== "passed" || !value.credentialDestroyed || Object.values(value.remaining || {}).some(Number)) {
+              throw new Error("Exact synthetic cleanup did not reach zero");
+            }
+          '
+
+      - name: Verify zero scoped residue and global owner orphans
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; cd \"\$ACTIVE_RELEASE\"; E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          (async () => {
+            const [accounts, orphanOwners] = await Promise.all([
+              prisma.user.count({ where: { phone: { startsWith: process.env.E2E_UAT_PREFIX } } }),
+              prisma.$queryRawUnsafe(`SELECT count(*)::int AS count FROM ai_chat_public_event_owners o WHERE NOT EXISTS (SELECT 1 FROM ai_conversations c WHERE c.id = o."conversationId")`),
+            ]);
+            const orphanCount = Number(orphanOwners[0]?.count || 0);
+            if (accounts !== 0 || orphanCount !== 0) throw new Error('Recovery residue verification failed');
+            console.log(JSON.stringify({ postRecovery: 'passed', scopedAccounts: accounts, globalOwnerOrphans: orphanCount }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          post=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$post" | tee recovery-artifacts/post-recovery.json
+
+      - name: Enforce recovery artifact privacy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          root = pathlib.Path('recovery-artifacts')
+          jwt = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+          connection = re.compile(rb'postgres(?:ql)?://[^:/\s]+:[^@/\s]+@', re.I)
+          protected_keys = re.compile(rb'"(?:token|jwt|jwtSecret|authorization|databaseUrl|credential)"\s*:', re.I)
+          for item in root.rglob('*'):
+              if not item.is_file():
+                  continue
+              data = item.read_bytes()
+              if jwt.search(data) or connection.search(data) or protected_keys.search(data):
+                  raise SystemExit(f'protected credential material detected in {item.name}')
+          print('artifact_privacy_gate=passed')
+          PY
+
+      - name: Upload bounded recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unified-resource-stuck-uat-recovery-${{ inputs.failed_uat_run_id }}
+          path: recovery-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record exact recovery acceptance
+        run: |
+          echo 'unified_resource_stuck_uat_recovery=passed'
+          echo 'active_sha=${{ inputs.active_sha }}'
+          echo 'failed_uat_run_id=${{ inputs.failed_uat_run_id }}'
