@@ -57,9 +57,13 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p runtime
-          npm install --prefix runtime --no-package-lock --no-save @playwright/test@1.55.1
-          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./runtime/node_modules/.bin/playwright install --with-deps chromium
+          npm install --no-package-lock --no-save @playwright/test@1.55.1
+          test -x ./node_modules/.bin/playwright
+          (
+            cd source/.github/e2e
+            node -e "const resolved=require.resolve('@playwright/test'); if (!resolved) throw new Error('Playwright test runtime is unresolved')"
+          )
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: Create isolated activated UAT session
         shell: bash
@@ -266,7 +270,6 @@ jobs:
           E2E_BASE_URL: https://zhiduoduoai.com
           EXPECTED_RELEASE: ${{ inputs.source_sha }}
           E2E_EVIDENCE_DIR: uat-artifacts
-          NODE_PATH: ${{ github.workspace }}/runtime/node_modules
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
         run: node source/.github/e2e/production-clickable-choice.cjs
 
