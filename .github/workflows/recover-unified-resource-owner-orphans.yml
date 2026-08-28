@@ -1,0 +1,280 @@
+name: Recover Unified Resource Owner Orphans
+run-name: "recover resource-owner orphans [active-${{ inputs.active_sha }} diagnostic-${{ inputs.diagnostic_run_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      active_sha:
+        description: Current immutable production release SHA
+        required: true
+      release_run_id:
+        description: Bound successful deployment run for active_sha
+        required: true
+      failed_deploy_sha:
+        description: Failed candidate SHA whose verified backup makes cleanup recoverable
+        required: true
+      failed_deploy_run_id:
+        description: Bound failed deployment run that created the backup
+        required: true
+      diagnostic_run_id:
+        description: Successful read-only owner diagnostic run
+        required: true
+      first_uat_run_id:
+        description: First failed UAT that created one orphan pair
+        required: true
+      second_uat_run_id:
+        description: Second failed UAT that created one orphan pair
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-production
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate release, backup, diagnostic, and UAT provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          FAILED_DEPLOY_SHA: ${{ inputs.failed_deploy_sha }}
+          FAILED_DEPLOY_RUN_ID: ${{ inputs.failed_deploy_run_id }}
+          DIAGNOSTIC_RUN_ID: ${{ inputs.diagnostic_run_id }}
+          FIRST_UAT_RUN_ID: ${{ inputs.first_uat_run_id }}
+          SECOND_UAT_RUN_ID: ${{ inputs.second_uat_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ACTIVE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FAILED_DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          for id in "$RELEASE_RUN_ID" "$FAILED_DEPLOY_RUN_ID" "$DIAGNOSTIC_RUN_ID" "$FIRST_UAT_RUN_ID" "$SECOND_UAT_RUN_ID"; do
+            [[ "$id" =~ ^[0-9]+$ ]]
+          done
+          release=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          failed=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$FAILED_DEPLOY_RUN_ID")
+          diagnostic=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$DIAGNOSTIC_RUN_ID")
+          first=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$FIRST_UAT_RUN_ID")
+          second=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$SECOND_UAT_RUN_ID")
+          RELEASE="$release" FAILED="$failed" DIAGNOSTIC="$diagnostic" FIRST="$first" SECOND="$second" node - <<'NODE'
+          const release = JSON.parse(process.env.RELEASE);
+          const failed = JSON.parse(process.env.FAILED);
+          const diagnostic = JSON.parse(process.env.DIAGNOSTIC);
+          const uatRuns = [JSON.parse(process.env.FIRST), JSON.parse(process.env.SECOND)];
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(release.status === 'completed' && release.conclusion === 'success', 'Active deployment is not successful');
+          assert(String(release.display_title || release.name).includes(process.env.ACTIVE_SHA), 'Active deployment is not SHA-bound');
+          assert(failed.status === 'completed' && failed.conclusion === 'failure', 'Candidate deployment is not the expected failed run');
+          assert(String(failed.display_title || failed.name).includes(process.env.FAILED_DEPLOY_SHA), 'Failed deployment is not SHA-bound');
+          assert(diagnostic.status === 'completed' && diagnostic.conclusion === 'success', 'Read-only diagnostic did not pass');
+          assert(String(diagnostic.path || '').includes('diagnose-unified-resource-owner-orphans.yml'), 'Diagnostic provenance is wrong');
+          for (const run of uatRuns) {
+            assert(run.status === 'completed' && run.conclusion === 'failure', 'Bound UAT is not a completed failed run');
+            assert(String(run.path || '').includes('verify-unified-resource-protocol.yml'), 'UAT provenance is wrong');
+            assert(String(run.display_title || run.name).includes(process.env.ACTIVE_SHA), 'UAT is not bound to active SHA');
+          }
+          NODE
+
+      - name: Install protected SSH runtime
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ASKPASS_SCRIPT="$RUNNER_TEMP/zhiduoduo-owner-recovery-askpass"
+          SSH_WRAPPER="$RUNNER_TEMP/zhiduoduo-owner-recovery-ssh"
+          printf '%s\n' '#!/usr/bin/env sh' 'printf "%s\n" "$SERVER_PASSWORD"' > "$ASKPASS_SCRIPT"
+          cat > "$SSH_WRAPPER" <<'SSH_WRAPPER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec timeout 600s setsid --wait ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=30 \
+            -o NumberOfPasswordPrompts=1 \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            "$@"
+          SSH_WRAPPER
+          chmod 700 "$ASKPASS_SCRIPT" "$SSH_WRAPPER"
+          {
+            echo "SSH_ASKPASS=$ASKPASS_SCRIPT"
+            echo 'SSH_ASKPASS_REQUIRE=force'
+            echo 'DISPLAY=zhiduoduo-owner-recovery:0'
+            echo "E2E_SSH_WRAPPER=$SSH_WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Remove only the four diagnosed synthetic owner rows
+        shell: bash
+        env:
+          ACTIVE_SHA: ${{ inputs.active_sha }}
+          FAILED_DEPLOY_SHA: ${{ inputs.failed_deploy_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p recovery-artifacts
+          output=$("$E2E_SSH_WRAPPER" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"/opt/apps/zhiduoduo-platform/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$ACTIVE_SHA'; BACKUP=\"\$APP_ROOT/backups/pre-deploy-$FAILED_DEPLOY_SHA.dump\"; test -s \"\$BACKUP\"; pg_restore --list \"\$BACKUP\" >/dev/null; cd \"\$ACTIVE_RELEASE\"; EXPECTED_RELEASE='$ACTIVE_SHA' node --env-file=\"\$APP_ROOT/shared/.env\" -" <<'NODE'
+          const crypto = require('node:crypto');
+          const { PrismaClient } = require('@prisma/client');
+          const prisma = new PrismaClient();
+          const hash = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          const mismatchSql = `
+            WITH raw AS MATERIALIZED (
+              SELECT e.id, e.payload -> 'mutation' AS mutation
+              FROM ai_chat_events e
+              WHERE e.type = 'conversation_event'
+            ), parsed AS MATERIALIZED (
+              SELECT raw.*,
+                CASE WHEN jsonb_typeof(mutation -> 'sequence') = 'number'
+                  THEN (mutation ->> 'sequence')::NUMERIC END AS sequence_numeric
+              FROM raw WHERE jsonb_typeof(mutation) = 'object'
+            ), candidates AS MATERIALIZED (
+              SELECT id,
+                mutation ->> 'conversationId' AS conversation_id,
+                CASE WHEN sequence_numeric = trunc(sequence_numeric)
+                      AND sequence_numeric BETWEEN 1 AND 2147483647
+                  THEN sequence_numeric::INTEGER END AS domain_sequence,
+                mutation ->> 'eventId' AS event_id,
+                mutation ->> 'turnId' AS turn_id,
+                mutation ->> 'kind' AS kind
+              FROM parsed
+              WHERE jsonb_typeof(mutation -> 'conversationId') = 'string'
+                AND length(btrim(mutation ->> 'conversationId')) > 0
+                AND jsonb_typeof(mutation -> 'eventId') = 'string'
+                AND length(btrim(mutation ->> 'eventId')) > 0
+                AND jsonb_typeof(mutation -> 'turnId') = 'string'
+                AND length(btrim(mutation ->> 'turnId')) > 0
+                AND jsonb_typeof(mutation -> 'kind') = 'string'
+                AND mutation ->> 'kind' IN (
+                  'user_text', 'assistant_text', 'skill', 'tool', 'video_quote',
+                  'choice', 'error', 'creative_artifact', 'interaction', 'unknown'
+                )
+            ), valid AS MATERIALIZED (
+              SELECT * FROM candidates WHERE domain_sequence IS NOT NULL
+            )
+            SELECT o."conversationId", o."domainSequence", o."eventId", o."turnId", o.kind, o."createdAt",
+              NOT EXISTS (SELECT 1 FROM ai_conversations c WHERE c.id = o."conversationId") AS "conversationMissing"
+            FROM ai_chat_public_event_owners o
+            WHERE NOT EXISTS (
+              SELECT 1 FROM valid v
+              WHERE o."conversationId" = v.conversation_id
+                AND o."domainSequence" = v.domain_sequence
+                AND o."eventId" = v.event_id
+                AND o."turnId" = v.turn_id
+                AND o.kind = v.kind
+            )
+            ORDER BY o."createdAt", o."conversationId", o."domainSequence"
+          `;
+          const identity = (row) => [
+            hash(row.conversationId),
+            hash(row.eventId),
+            hash(row.turnId),
+            row.domainSequence,
+            row.kind,
+            new Date(row.createdAt).toISOString(),
+          ].join('|');
+          const expected = new Set([
+            '30b7d2a1f7eee17e|2cd2fca0b012402f|b7bce5cd64e19741|3|user_text|2026-08-28T03:21:09.070Z',
+            '30b7d2a1f7eee17e|1aa4dbdc5fea62a2|b7bce5cd64e19741|8|error|2026-08-28T03:21:11.370Z',
+            '8d364bb7d156187d|d84f189d65235bf5|4794db8fd3f4879f|3|user_text|2026-08-28T03:28:48.941Z',
+            '8d364bb7d156187d|c0377d3356ff3091|4794db8fd3f4879f|8|error|2026-08-28T03:28:50.780Z',
+          ]);
+
+          (async () => {
+            const result = await prisma.$transaction(async (tx) => {
+              const rows = await tx.$queryRawUnsafe(mismatchSql);
+              assert(rows.length === expected.size, `Expected ${expected.size} diagnosed rows, found ${rows.length}`);
+              assert(rows.every((row) => row.conversationMissing === true), 'A diagnosed owner still has a live conversation');
+              const actual = new Set(rows.map(identity));
+              assert(actual.size === expected.size && [...expected].every((key) => actual.has(key)), 'Owner identities drifted from read-only evidence');
+              const removed = await tx.aiChatPublicEventOwner.deleteMany({
+                where: {
+                  OR: rows.map((row) => ({
+                    conversationId: row.conversationId,
+                    domainSequence: row.domainSequence,
+                  })),
+                },
+              });
+              assert(removed.count === expected.size, `Removed ${removed.count} rows instead of ${expected.size}`);
+              const remaining = await tx.$queryRawUnsafe(mismatchSql);
+              assert(remaining.length === 0, `Owner mismatch residue remains: ${remaining.length}`);
+              return { removed: rows.map(identity).sort(), remaining: remaining.length };
+            });
+            console.log(JSON.stringify({
+              recovery: 'passed',
+              mutation: 'delete-exact-task-orphan-owner-rows',
+              release: process.env.EXPECTED_RELEASE,
+              backupValidated: true,
+              removedCount: result.removed.length,
+              removedIdentities: result.removed,
+              remainingMismatchCount: result.remaining,
+            }));
+          })().finally(() => prisma.$disconnect());
+          NODE
+          )
+          report=$(printf '%s\n' "$output" | tail -n 1)
+          printf '%s\n' "$report" | tee recovery-artifacts/owner-orphan-recovery.json
+          REPORT="$report" node -e '
+            const report = JSON.parse(process.env.REPORT);
+            if (report.recovery !== "passed" || report.removedCount !== 4 || report.remainingMismatchCount !== 0 || !report.backupValidated) {
+              throw new Error("Exact owner recovery did not reach zero residue");
+            }
+          '
+
+      - name: Enforce recovery artifact privacy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          root = pathlib.Path('recovery-artifacts')
+          jwt = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+          connection = re.compile(rb'postgres(?:ql)?://[^:/\s]+:[^@/\s]+@', re.I)
+          protected_keys = re.compile(rb'"(?:token|jwt|jwtSecret|authorization|databaseUrl|credential)"\s*:', re.I)
+          for item in root.rglob('*'):
+              if not item.is_file():
+                  continue
+              data = item.read_bytes()
+              if jwt.search(data) or connection.search(data) or protected_keys.search(data):
+                  raise SystemExit(f'protected credential material detected in {item.name}')
+          print('recovery_artifact_privacy_gate=passed')
+          PY
+
+      - name: Upload exact recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unified-resource-owner-orphan-recovery-${{ inputs.diagnostic_run_id }}
+          path: recovery-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record exact recovery
+        if: success()
+        run: |
+          echo 'unified_resource_owner_orphan_recovery=passed'
+          echo 'removed_count=4'
+          echo 'remaining_mismatch_count=0'
+          echo 'active_sha=${{ inputs.active_sha }}'
+          echo 'diagnostic_run_id=${{ inputs.diagnostic_run_id }}'
