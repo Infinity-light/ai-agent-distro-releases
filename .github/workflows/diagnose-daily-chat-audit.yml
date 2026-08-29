@@ -1,0 +1,182 @@
+name: Audit Zhiduoduo Daily Chats Read Only
+run-name: "audit daily chats ${{ inputs.audit_date }} ${{ inputs.source_sha }} [harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Active immutable production source SHA
+        required: true
+      harness_sha:
+        description: Immutable private source SHA containing the audited collector
+        required: true
+      audit_date:
+        description: Full Asia/Shanghai calendar day (YYYY-MM-DD)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zhiduoduo-daily-chat-readonly-${{ inputs.audit_date }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate immutable and bounded inputs
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          AUDIT_DATE: ${{ inputs.audit_date }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AUDIT_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          AUDIT_DATE="$AUDIT_DATE" node - <<'NODE'
+          const value = process.env.AUDIT_DATE;
+          const start = new Date(`${value}T00:00:00+08:00`);
+          if (Number.isNaN(start.getTime()) || start.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }) !== value) {
+            throw new Error('Invalid Asia/Shanghai audit day');
+          }
+          NODE
+
+      - name: Checkout immutable private collector
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Gate collector syntax and mutation boundary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          COLLECTOR=source/.workflow/verification/zdd-flat-chat-events/daily-cross-account-readonly.cjs
+          test -f "$COLLECTOR"
+          node --check "$COLLECTOR"
+          node - "$COLLECTOR" <<'NODE'
+          const collector = require(`${process.cwd()}/${process.argv[2]}`);
+          const writes = [];
+          const raw = {
+            aiMessage: {
+              findMany: async () => [],
+              create: async () => writes.push('create'),
+            },
+            $queryRawUnsafe: async () => [],
+          };
+          const client = collector.readOnlyClient(raw);
+          Promise.resolve(client.aiMessage.findMany())
+            .then(() => {
+              try { void client.aiMessage.create; throw new Error('Mutation method was exposed'); }
+              catch (error) { if (!String(error.message).includes('rejected Prisma method')) throw error; }
+              try { void client.$queryRawUnsafe('UPDATE ai_messages SET content = content'); throw new Error('Write SQL was exposed'); }
+              catch (error) { if (!String(error.message).includes('non-SELECT')) throw error; }
+              if (writes.length) throw new Error('Mutation fixture executed');
+            });
+          NODE
+
+      - name: Collect the full day through a database-enforced read-only session
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          AUDIT_DATE: ${{ inputs.audit_date }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p audit-artifacts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh"
+          if [ "$SERVER_PORT" = "22" ]; then KNOWN_HOST="$SERVER_HOST"; else KNOWN_HOST="[$SERVER_HOST]:$SERVER_PORT"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          REMOTE_COLLECTOR="/tmp/zdd-daily-chat-audit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
+          cleanup_remote() {
+            sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              "$SERVER_USER@$SERVER_HOST" "test ! -e '$REMOTE_COLLECTOR' || rm -f -- '$REMOTE_COLLECTOR'" >/dev/null 2>&1 || true
+          }
+          trap cleanup_remote EXIT
+          sshpass -p "$SERVER_PASSWORD" scp -P "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            source/.workflow/verification/zdd-flat-chat-events/daily-cross-account-readonly.cjs \
+            "$SERVER_USER@$SERVER_HOST:$REMOTE_COLLECTOR"
+          actor_hash=$(printf '%s' "$GITHUB_ACTOR" | sha256sum | cut -d' ' -f1)
+          sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' AUDIT_DATE='$AUDIT_DATE' AUDIT_RUN_ID='$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT' AUDIT_ACTOR_HASH='$actor_hash' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_COLLECTOR'" \
+            > audit-artifacts/daily-chat-audit.json
+
+      - name: Verify bounded redacted evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          AUDIT_DATE: ${{ inputs.audit_date }}
+        run: |
+          set -Eeuo pipefail
+          SOURCE_SHA="$SOURCE_SHA" AUDIT_DATE="$AUDIT_DATE" node - <<'NODE'
+          const fs = require('node:fs');
+          const file = 'audit-artifacts/daily-chat-audit.json';
+          const raw = fs.readFileSync(file, 'utf8');
+          const evidence = JSON.parse(raw);
+          const assert = (condition, message) => { if (!condition) throw new Error(message); };
+          assert(evidence.schemaVersion === 1, 'Unexpected evidence schema');
+          assert(evidence.product === 'zhiduoduo', 'Unexpected product boundary');
+          assert(evidence.release === process.env.SOURCE_SHA, 'Evidence release drift');
+          assert(evidence.audit?.day === process.env.AUDIT_DATE && evidence.audit?.timezone === 'Asia/Shanghai', 'Audit window drift');
+          assert(evidence.readOnly === true && evidence.mutations === 'none', 'Mutation boundary missing');
+          assert(evidence.databaseGuard?.defaultTransactionReadOnly === true, 'Default read-only guard missing');
+          assert(evidence.databaseGuard?.transactionReadOnly === true, 'Transaction read-only guard missing');
+          assert(evidence.databaseGuard?.rawSql === 'SELECT_ONLY', 'SQL allowlist missing');
+          assert(evidence.coverage?.complete === true, 'Collector reported incomplete coverage');
+          assert(!/(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?):\/\//iu.test(raw), 'Database URL leaked');
+          assert(!/Bearer\s+(?!\[REDACTED\])/iu.test(raw), 'Bearer credential leaked');
+          assert(!/\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u.test(raw), 'JWT leaked');
+          assert(!/(?:userId|conversationId|requestId|callId|actionId|JWT_SECRET|DATABASE_URL|passwordHash)"\s*:/u.test(raw), 'Private identifier field leaked');
+          const summary = {
+            schemaVersion: evidence.schemaVersion,
+            readOnly: evidence.readOnly,
+            mutations: evidence.mutations,
+            release: evidence.release,
+            audit: evidence.audit,
+            databaseGuard: evidence.databaseGuard,
+            coverage: evidence.coverage,
+            anomalyCounts: Object.entries((evidence.anomalies || []).reduce((acc, item) => {
+              const key = `${item.severity}:${item.code}`;
+              acc[key] = (acc[key] || 0) + Number(item.count || 1);
+              return acc;
+            }, {})).map(([code, count]) => ({ code, count })),
+            evidenceSha256: require('node:crypto').createHash('sha256').update(raw).digest('hex'),
+          };
+          fs.writeFileSync('audit-artifacts/audit-receipt.json', `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+          NODE
+
+      - name: Upload immutable bounded audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: daily-chat-readonly-${{ inputs.audit_date }}-${{ inputs.source_sha }}
+          path: audit-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record SELECT-only audit boundary
+        if: success()
+        run: |
+          echo 'daily_chat_audit=passed'
+          echo 'mutations=none'
+          echo 'database_transaction=read_only'
+          echo 'raw_sql=select_only'
+          echo 'audit_date=${{ inputs.audit_date }}'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'harness_sha=${{ inputs.harness_sha }}'

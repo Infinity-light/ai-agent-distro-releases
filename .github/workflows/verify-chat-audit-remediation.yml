@@ -1,0 +1,184 @@
+name: Verify Zhiduoduo Chat Audit Remediation
+run-name: "verify chat audit remediation ${{ inputs.source_sha }} [deploy-run-${{ inputs.release_run_id }} harness-${{ inputs.harness_sha }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Deployed immutable source SHA
+        required: true
+      release_run_id:
+        description: Bound successful production deployment run ID
+        required: true
+      harness_sha:
+        description: Immutable source SHA containing the UAT assertions
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zhiduoduo-chat-audit-remediation-production-uat
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Validate exact deployment binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          HARNESS_SHA: ${{ inputs.harness_sha }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/Infinity-light/ai-agent-distro-releases/actions/runs/$RELEASE_RUN_ID")
+          RUN="$run" node - <<'NODE'
+          const run = JSON.parse(process.env.RUN);
+          if (run.status !== 'completed' || run.conclusion !== 'success') throw new Error('Bound deployment is not successful');
+          if (!String(run.display_title || run.name).includes(process.env.SOURCE_SHA)) throw new Error('Deployment is not bound to SOURCE_SHA');
+          NODE
+
+      - name: Checkout immutable source UAT harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Infinity-light/ai-agent-distro
+          ref: ${{ inputs.harness_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          path: source
+
+      - name: Install explicit browser runtime and SSH client
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime uat-artifacts
+          npm install --prefix runtime --no-package-lock --no-save @playwright/test@1.55.1
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers" ./runtime/node_modules/.bin/playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 "$HOME/.ssh"
+          if [ "${{ secrets.SERVER_PORT }}" = "22" ]; then KNOWN_HOST="${{ secrets.SERVER_HOST }}"; else KNOWN_HOST="[${{ secrets.SERVER_HOST }}]:${{ secrets.SERVER_PORT }}"; fi
+          printf '%s %s\n' "$KNOWN_HOST" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPozXPwB/2d1z/Rw8ysubUWKlOZJYqXUqmIP8BeCrq4j' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Create exact zero-cost synthetic projection
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          E2E_UAT_PREFIX="zdd-chat-audit-uat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "E2E_UAT_PREFIX=$E2E_UAT_PREFIX" >> "$GITHUB_ENV"
+          REMOTE_LEDGER="/tmp/zdd-chat-audit-ledger-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
+          cleanup_remote() {
+            sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              "$SERVER_USER@$SERVER_HOST" "test ! -e '$REMOTE_LEDGER' || rm -f -- '$REMOTE_LEDGER'" >/dev/null 2>&1 || true
+          }
+          trap cleanup_remote EXIT
+          sshpass -p "$SERVER_PASSWORD" scp -P "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            source/.github/e2e/production-chat-audit-remediation-ledger.cjs "$SERVER_USER@$SERVER_HOST:$REMOTE_LEDGER"
+          setup_json=$(sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER' setup")
+          SETUP_JSON="$setup_json" RUNNER_TEMP="$RUNNER_TEMP" node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const data = JSON.parse(process.env.SETUP_JSON);
+          for (const key of ['ownerToken', 'otherToken', 'ownerUserId', 'otherUserId', 'conversationId', 'actionId', 'projectId', 'productionId', 'title']) {
+            if (!data[key]) throw new Error(`Setup binding is missing ${key}`);
+          }
+          const owner = path.join(process.env.RUNNER_TEMP, 'zdd-chat-audit-owner.token');
+          const other = path.join(process.env.RUNNER_TEMP, 'zdd-chat-audit-other.token');
+          const binding = path.join(process.env.RUNNER_TEMP, 'zdd-chat-audit-binding.json');
+          fs.writeFileSync(owner, data.ownerToken, { mode: 0o600 });
+          fs.writeFileSync(other, data.otherToken, { mode: 0o600 });
+          const { ownerToken, otherToken, ...safeBinding } = data;
+          fs.writeFileSync(binding, JSON.stringify(safeBinding), { mode: 0o600 });
+          fs.appendFileSync(process.env.GITHUB_ENV, `E2E_OWNER_TOKEN_FILE=${owner}\nE2E_OTHER_TOKEN_FILE=${other}\nE2E_BINDING_FILE=${binding}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT || '/dev/null', 'setup=complete\n');
+          process.stdout.write(`::add-mask::${data.ownerToken}\n::add-mask::${data.otherToken}\n`);
+          NODE
+
+      - name: Run desktop 390px and installed-PWA zero-cost UAT
+        env:
+          EXPECTED_RELEASE: ${{ inputs.source_sha }}
+          E2E_BASE_URL: https://zhiduoduoai.com
+          E2E_EVIDENCE_DIR: uat-artifacts
+          NODE_PATH: ${{ github.workspace }}/runtime/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: node source/.github/e2e/production-chat-audit-remediation.cjs
+
+      - name: Assert zero Provider calls and zero billing side effects
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          REMOTE_LEDGER="/tmp/zdd-chat-audit-ledger-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
+          trap 'sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" "$SERVER_USER@$SERVER_HOST" "test ! -e '\''$REMOTE_LEDGER'\'' || rm -f -- '\''$REMOTE_LEDGER'\''" >/dev/null 2>&1 || true' EXIT
+          sshpass -p "$SERVER_PASSWORD" scp -P "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            source/.github/e2e/production-chat-audit-remediation-ledger.cjs "$SERVER_USER@$SERVER_HOST:$REMOTE_LEDGER"
+          sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER' audit" \
+            | tee uat-artifacts/zero-cost-ledger.json
+
+      - name: Remove exact synthetic UAT rows
+        if: always()
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p uat-artifacts
+          if [ -z "${E2E_UAT_PREFIX:-}" ]; then
+            printf '{"cleanupComplete":false,"reason":"no UAT prefix allocated"}\n' | tee uat-artifacts/cleanup.json
+            exit 1
+          fi
+          REMOTE_LEDGER="/tmp/zdd-chat-audit-ledger-cleanup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.cjs"
+          trap 'sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" "$SERVER_USER@$SERVER_HOST" "test ! -e '\''$REMOTE_LEDGER'\'' || rm -f -- '\''$REMOTE_LEDGER'\''" >/dev/null 2>&1 || true' EXIT
+          sshpass -p "$SERVER_PASSWORD" scp -P "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            source/.github/e2e/production-chat-audit-remediation-ledger.cjs "$SERVER_USER@$SERVER_HOST:$REMOTE_LEDGER"
+          sshpass -p "$SERVER_PASSWORD" ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            "APP_ROOT=/opt/apps/zhiduoduo-platform; ACTIVE_RELEASE=\$(readlink -f \"\$APP_ROOT/current\"); test \"\$(basename \"\$ACTIVE_RELEASE\")\" = '$SOURCE_SHA'; cd \"\$ACTIVE_RELEASE\"; NODE_PATH=\"\$ACTIVE_RELEASE/node_modules\" EXPECTED_RELEASE='$SOURCE_SHA' E2E_UAT_PREFIX='$E2E_UAT_PREFIX' node --env-file=\"\$APP_ROOT/shared/.env\" '$REMOTE_LEDGER' cleanup" \
+            | tee uat-artifacts/cleanup.json
+          rm -f -- "$E2E_OWNER_TOKEN_FILE" "$E2E_OTHER_TOKEN_FILE" "$E2E_BINDING_FILE"
+
+      - name: Upload immutable production UAT evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chat-audit-remediation-${{ inputs.source_sha }}
+          path: uat-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record zero-cost production acceptance
+        if: success()
+        run: |
+          echo 'chat_audit_remediation_uat=passed'
+          echo 'paid_video_generation=false'
+          echo 'provider_attempts=0'
+          echo 'credit_reservations=0'
+          echo 'source_sha=${{ inputs.source_sha }}'
+          echo 'release_run_id=${{ inputs.release_run_id }}'
